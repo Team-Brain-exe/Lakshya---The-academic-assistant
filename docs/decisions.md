@@ -59,6 +59,21 @@ Free tier or Nebius Serverless Endpoints. Aparna owns the demo URL through judgi
 
 The team files describe three people (Danwin, Aparna, Arya). The deadline is not written down anywhere yet. Everything else in the plan depends on it, so someone should find it today.
 
+## 7. Assumptions built into the CO math (Arya, confirm with faculty)
+
+**Status: Proposed.** Each one is a single argument or line to change, so none is hard to reverse.
+
+| Assumption | Where | Alternative |
+| --- | --- | --- |
+| Attainment denominator is every enrolled student, as in the brief. A student with no attempt counts as not attained | `class_summary(..., denominator="enrolled")` | `denominator="attempted"` counts only students who have a score |
+| A blank answer earns 0 but still counts toward the maximum | `grade_attempt` | Exclude unanswered questions from the maximum |
+| A CO nobody has attempted is "no data" and is not flagged weak | `weak_cos` | Flag it as weak |
+| Under `best`, a tie on total marks goes to the later attempt | `select_counted` | Prefer the earlier attempt |
+| Scores are summed across quizzes (marks obtained over marks possible), not averaged per quiz | `aggregate_student_scores` | Average each quiz's percentage |
+| Under `average`, each CO's obtained and maximum are the mean across attempts | `select_counted` | Treat the two attempts as one larger quiz |
+
+Ask faculty about the first and the fifth. They change the numbers most.
+
 ## Decided so far
 
 - Track: Best Apps and Agents.

@@ -1,0 +1,4 @@
+# Arya's modules (engine, pipeline, export). Aparna adds the FastAPI and database packages.
+python-pptx>=1.0
+openpyxl>=3.1
+pytest>=8.0

@@ -72,12 +72,27 @@ Seed demo data (TODO):
 python seed/seed.py
 ```
 
-## How grading works (TODO: Aparna / Arya)
+## How grading works
+
+All of this is plain Python in `backend/app/engine/`. No LLM is called anywhere in it.
 
 - Each question belongs to exactly one CO.
-- Marks are computed in backend code by comparing answers with the stored correct option, then split by CO.
-- Which attempt counts (best, latest or average) is set by `ATTEMPT_RULE`. Default is `best` until faculty confirm.
-- The LLM never computes or changes a mark.
+- An attempt is graded by comparing each answer with the stored correct option and summing the question's marks. The marks are then split by CO.
+- A question left blank, or answered with an invalid option, earns 0 but still counts toward the maximum, because it was shown to the student.
+- A CO with no questions in scope is "no data", shown as blank. It is never 0, and it is left out of averages.
+- A student's CO score is `sum(marks obtained) / sum(maximum marks) × 100` over the counted quizzes in scope (one module, or the whole semester).
+- Which attempt counts when a student attempts a quiz twice is set by `ATTEMPT_RULE`: `best` (highest total, a tie goes to the later attempt), `latest`, or `average` (mean per CO). **The default is `best` until faculty confirm.**
+- Class attainment for a CO is the share of enrolled students whose CO score is at or above the CO threshold. A CO is "weak" when attainment is below its target. Thresholds and targets are set per CO by faculty and have no defaults in the math.
+- The Excel export is built from the same sheet the screen shows (`backend/app/export/`).
+
+## Running the tests
+
+```bash
+pip install -r backend/requirements.txt
+pytest
+```
+
+`pytest.ini` points at `backend/` and `tests/unit/`, so no other setup is needed.
 
 ## Demo data
 
