@@ -77,13 +77,6 @@ def _analyze_rows(rows: list[dict]):
     # Split valid rows: first occurrence valid, subsequent are duplicates
     unique_valid = []
     duplicates_in_file = []
-    for v in valid_rows:
-        row_num, usn, name, section, pin = v
-        if len(seen_usns[usn]) > 1:
-            duplicates_in_file.append({"usn": usn, "rows": seen_usns[usn]})
-        # Only the first occurrence is "valid" — but we need to avoid
-        # adding it twice. Use a set to track.
-    # Rebuild: unique_valid = first occurrence only
     seen: set[str] = set()
     for v in valid_rows:
         row_num, usn, name, section, pin = v
@@ -91,6 +84,8 @@ def _analyze_rows(rows: list[dict]):
             continue
         seen.add(usn)
         unique_valid.append(v)
+        if len(seen_usns[usn]) > 1:
+            duplicates_in_file.append({"usn": usn, "rows": seen_usns[usn]})
 
     return {
         "total_rows": len(rows),
@@ -112,7 +107,7 @@ def _subject_owned(conn, subject_id: str, faculty_user_id: str):
     row = conn.execute(
         text("SELECT id FROM subjects WHERE id = :id AND faculty_user_id = :fid"),
         {"id": subject_id, "fid": faculty_user_id},
-    ).fetchone()
+    ).mappings().fetchone()
     if row is None:
         raise AppError(404, "NOT_FOUND", "Subject not found")
     return row
@@ -153,7 +148,7 @@ def preview_roster(
                 f"WHERE e.subject_id = :sid AND s.usn IN ({placeholders})"
             ),
             {"sid": id},
-        ).fetchall()
+        ).mappings().fetchall()
         already_enrolled = [r["usn"] for r in enrolled]
 
     # Remove the internal key before returning
@@ -180,7 +175,22 @@ def confirm_roster(
 
     analysis = _analyze_rows(rows)
     valid_rows = analysis["valid_parsed"]
-    already_enrolled_set = set(analysis["already_enrolled"])
+
+    # Check already enrolled
+    valid_usns = [v[1] for v in valid_rows]
+    already_enrolled = []
+    if valid_usns:
+        placeholders = ", ".join(f"'{u}'" for u in valid_usns)
+        enrolled = conn.execute(
+            text(
+                f"SELECT DISTINCT s.usn FROM enrollments e "
+                f"JOIN students s ON s.id = e.student_id "
+                f"WHERE e.subject_id = :sid AND s.usn IN ({placeholders})"
+            ),
+            {"sid": id},
+        ).mappings().fetchall()
+        already_enrolled = [r["usn"] for r in enrolled]
+    already_enrolled_set = set(already_enrolled)
 
     created_students = 0
     created_enrollments = 0
@@ -192,7 +202,7 @@ def confirm_roster(
         existing = conn.execute(
             text("SELECT id, pin_hash FROM students WHERE usn = :usn"),
             {"usn": usn},
-        ).fetchone()
+        ).mappings().fetchone()
 
         if existing is not None:
             student_id = str(existing["id"])
@@ -224,7 +234,7 @@ def confirm_roster(
                 ),
                 {"usn": usn, "name": name, "ph": pin_hash},
             )
-            student_id = str(result.fetchone()["id"])
+            student_id = str(result.mappings().fetchone()["id"])
             created_students += 1
 
             # Create users row (role student)

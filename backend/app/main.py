@@ -17,7 +17,6 @@ from .routers import auth, subjects, modules, roster, questions, health, quizzes
 app = FastAPI(
     title="Academic Assistant & CO Tracker",
     description="FastAPI backend for academics, grading and CO attainment.",
-    default_response_class=None,
 )
 
 # ---------------------------------------------------------------------------

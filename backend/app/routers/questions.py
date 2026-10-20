@@ -1,6 +1,7 @@
 import json
 
 from fastapi import APIRouter, Depends, Body, Path, Query
+from fastapi.responses import JSONResponse
 from sqlalchemy import text
 
 from ..db import get_conn
@@ -40,7 +41,7 @@ def _validate_module_and_co(conn, module_id: str, co_id: str, faculty_user_id: s
         "SELECT m.subject_id AS subject_id "
         "FROM modules m WHERE m.id = :mid"
     )
-    mod = conn.execute(stmt, {"mid": str(module_id)}).fetchone()
+    mod = conn.execute(stmt, {"mid": str(module_id)}).mappings().fetchone()
     if mod is None:
         raise AppError(404, "NOT_FOUND", "Module not found")
 
@@ -50,7 +51,7 @@ def _validate_module_and_co(conn, module_id: str, co_id: str, faculty_user_id: s
             "SELECT 1 FROM subjects s WHERE s.id = :sid AND s.faculty_user_id = :fid"
         ),
         {"sid": str(mod["subject_id"]), "fid": faculty_user_id},
-    ).fetchone()
+    ).mappings().fetchone()
     if owner is None:
         raise AppError(404, "NOT_FOUND", "Module not found")
 
@@ -61,7 +62,7 @@ def _validate_module_and_co(conn, module_id: str, co_id: str, faculty_user_id: s
             "WHERE id = :cid AND subject_id = :sid"
         ),
         {"cid": str(co_id), "sid": str(mod["subject_id"])},
-    ).fetchone()
+    ).mappings().fetchone()
     if co is None:
         raise AppError(404, "NOT_FOUND", "CO not found or does not belong to the module's subject")
     return co
@@ -79,7 +80,7 @@ def _question_owned(conn, question_id: str, faculty_user_id: str):
             "WHERE q.id = :qid AND s.faculty_user_id = :fid"
         ),
         {"qid": str(question_id), "fid": faculty_user_id},
-    ).fetchone()
+    ).mappings().fetchone()
     if row is None:
         raise AppError(404, "NOT_FOUND", "Question not found")
     return row
@@ -106,7 +107,7 @@ def list_questions(
             "WHERE m.id = :mid AND s.faculty_user_id = :fid"
         ),
         {"mid": str(module_id), "fid": faculty["user_id"]},
-    ).fetchone()
+    ).mappings().fetchone()
     if mod is None:
         raise AppError(404, "NOT_FOUND", "Module not found")
 
@@ -129,7 +130,7 @@ def list_questions(
             "WHERE " + " AND ".join(where) + " ORDER BY q.created_at"
         ),
         params,
-    ).fetchall()
+    ).mappings().fetchall()
     return [_row_to_question(r) for r in rows]
 
 
@@ -177,7 +178,7 @@ def create_question(
             "created_by": faculty["user_id"],
         },
     )
-    row = result.fetchone()
+    row = result.mappings().fetchone()
 
     # Re-fetch with co_number join
     full = conn.execute(
@@ -187,8 +188,8 @@ def create_question(
             "WHERE q.id = :id"
         ),
         {"id": str(row["id"])},
-    ).fetchone()
-    return _row_to_question(full), 201
+    ).mappings().fetchone()
+    return JSONResponse(content=_row_to_question(full), status_code=201)
 
 
 @router.post("/questions/batch")
@@ -232,7 +233,7 @@ def create_questions_batch(
                 "created_by": faculty["user_id"],
             },
         )
-        qid = str(result.fetchone()["id"])
+        qid = str(result.mappings().fetchone()["id"])
         created.append(qid)
 
     # Fetch all created questions with co_number
@@ -243,8 +244,8 @@ def create_questions_batch(
             "LEFT JOIN course_outcomes co ON co.id = q.co_id "
             "WHERE q.id IN (" + placeholders + ") ORDER BY q.created_at"
         ),
-    ).fetchall()
-    return [_row_to_question(r) for r in rows], 201
+    ).mappings().fetchall()
+    return JSONResponse(content=[_row_to_question(r) for r in rows], status_code=201)
 
 
 @router.patch("/questions/{id}")
@@ -269,7 +270,7 @@ def update_question(
         qrow = conn.execute(
             text("SELECT module_id FROM questions WHERE id = :id"),
             {"id": id},
-        ).fetchone()
+        ).mappings().fetchone()
         _validate_module_and_co(conn, str(qrow["module_id"]), str(updates["co_id"]),
                                 faculty["user_id"])
 
@@ -297,7 +298,7 @@ def update_question(
         ),
         params,
     )
-    updated = result.fetchone()
+    updated = result.mappings().fetchone()
     if updated is None:
         raise AppError(404, "NOT_FOUND", "Question not found")
 
@@ -309,7 +310,7 @@ def update_question(
             "WHERE q.id = :id"
         ),
         {"id": id},
-    ).fetchone()
+    ).mappings().fetchone()
     return _row_to_question(full)
 
 
@@ -324,7 +325,7 @@ def approve_question(
         text("UPDATE questions SET status = 'approved' WHERE id = :id RETURNING *"),
         {"id": id},
     )
-    updated = result.fetchone()
+    updated = result.mappings().fetchone()
     full = conn.execute(
         text(
             "SELECT q.*, co.number AS co_number FROM questions q "
@@ -332,7 +333,7 @@ def approve_question(
             "WHERE q.id = :id"
         ),
         {"id": id},
-    ).fetchone()
+    ).mappings().fetchone()
     return _row_to_question(full)
 
 
@@ -354,5 +355,5 @@ def reject_question(
             "WHERE q.id = :id"
         ),
         {"id": id},
-    ).fetchone()
+    ).mappings().fetchone()
     return _row_to_question(full)

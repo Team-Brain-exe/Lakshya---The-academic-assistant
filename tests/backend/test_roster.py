@@ -39,7 +39,7 @@ def test_roster_preview_saves_nothing(client, ctx):
     try:
         rows = conn.execute(
             text("SELECT COUNT(*) AS c FROM students WHERE usn IN ('1AT0CS001','1AT0CS002')")
-        ).fetchone()
+        ).mappings().fetchone()
     finally:
         conn.close()
     assert rows["c"] == 0

@@ -1,6 +1,7 @@
 from typing import Optional
 
 from fastapi import APIRouter, Depends, Body, Path
+from fastapi.responses import JSONResponse
 from sqlalchemy import text
 
 from ..db import get_conn
@@ -19,7 +20,7 @@ def _subject_owned(conn, subject_id: str, faculty_user_id: str):
     row = conn.execute(
         text("SELECT * FROM subjects WHERE id = :id"),
         {"id": subject_id},
-    ).fetchone()
+    ).mappings().fetchone()
     if row is None or str(row["faculty_user_id"]) != faculty_user_id:
         raise AppError(404, "NOT_FOUND", "Subject not found")
     return row
@@ -30,7 +31,7 @@ def _subject_visible(conn, subject_id: str, current_user: dict):
     row = conn.execute(
         text("SELECT * FROM subjects WHERE id = :id"),
         {"id": subject_id},
-    ).fetchone()
+    ).mappings().fetchone()
     if row is None:
         raise AppError(404, "NOT_FOUND", "Subject not found")
     if current_user["role"] == "faculty":
@@ -43,7 +44,7 @@ def _subject_visible(conn, subject_id: str, current_user: dict):
                 "SELECT 1 FROM enrollments WHERE student_id = :sid AND subject_id = :sid2"
             ),
             {"sid": current_user["student_id"], "sid2": subject_id},
-        ).fetchone()
+        ).mappings().fetchone()
         if enrollment is None:
             raise AppError(404, "NOT_FOUND", "Subject not found")
     return row
@@ -91,7 +92,7 @@ def list_subjects(
                 "ORDER BY code, semester"
             ),
             {"uid": uid},
-        ).fetchall()
+        ).mappings().fetchall()
     else:
         # Student: subjects they are enrolled in
         rows = conn.execute(
@@ -101,7 +102,7 @@ def list_subjects(
                 "WHERE e.student_id = :sid ORDER BY s.code, s.semester"
             ),
             {"sid": current_user["student_id"]},
-        ).fetchall()
+        ).mappings().fetchall()
 
     return [_row_to_subject(r) for r in rows]
 
@@ -137,8 +138,8 @@ def create_subject(
             "threshold": threshold,
         },
     )
-    row = result.fetchone()
-    return _row_to_subject(row), 201
+    row = result.mappings().fetchone()
+    return JSONResponse(content=_row_to_subject(row), status_code=201)
 
 
 @router.get("/subjects/{id}")
@@ -152,12 +153,12 @@ def get_subject(
     cos_rows = conn.execute(
         text("SELECT * FROM course_outcomes WHERE subject_id = :sid ORDER BY number"),
         {"sid": id},
-    ).fetchall()
+    ).mappings().fetchall()
 
     module_rows = conn.execute(
         text("SELECT * FROM modules WHERE subject_id = :sid ORDER BY number"),
         {"sid": id},
-    ).fetchall()
+    ).mappings().fetchall()
 
     return {
         **_row_to_subject(row),
@@ -207,7 +208,7 @@ def update_subject(
         ),
         params,
     )
-    row = result.fetchone()
+    row = result.mappings().fetchone()
     if row is None:
         raise AppError(404, "NOT_FOUND", "Subject not found")
     return _row_to_subject(row)
@@ -244,7 +245,7 @@ def list_cos(
     rows = conn.execute(
         text("SELECT * FROM course_outcomes WHERE subject_id = :sid ORDER BY number"),
         {"sid": id},
-    ).fetchall()
+    ).mappings().fetchall()
     return [_row_to_co(r) for r in rows]
 
 
@@ -300,7 +301,7 @@ def upsert_cos(
                 "target": target,
             },
         )
-        row = result.fetchone()
+        row = result.mappings().fetchone()
         result_rows.append(_row_to_co(row))
 
     # Return only the COs for this subject, ordered by number

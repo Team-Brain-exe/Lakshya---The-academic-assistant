@@ -97,7 +97,7 @@ def ctx(db, client):
             ),
             {"email": email, "name": name, "hash": pw_hash},
         )
-        user_id = str(result.fetchone()["id"])
+        user_id = str(result.mappings().fetchone()["id"])
         db.commit()
         cleanup["users"].append(user_id)
         # Also delete subjects owned by this faculty (in case make_subject cleanup misses some)
@@ -122,7 +122,7 @@ def ctx(db, client):
             ),
             {"usn": usn, "name": name, "hash": pin_hash},
         )
-        student_id = str(result.fetchone()["id"])
+        student_id = str(result.mappings().fetchone()["id"])
 
         db.execute(
             text("INSERT INTO users (role, student_id) VALUES ('student', :sid)"),
@@ -149,7 +149,7 @@ def ctx(db, client):
                 "fid": faculty_user_id, "target": target, "threshold": threshold,
             },
         )
-        subject_id = str(result.fetchone()["id"])
+        subject_id = str(result.mappings().fetchone()["id"])
         db.commit()
         cleanup["subjects"].append(subject_id)
         return {
@@ -167,7 +167,7 @@ def ctx(db, client):
             ),
             {"sid": subject_id, "num": number, "desc": desc},
         )
-        co_id = str(result.fetchone()["id"])
+        co_id = str(result.mappings().fetchone()["id"])
         db.commit()
         return {"co_id": co_id, "subject_id": subject_id,
                 "number": number, "description": desc}
@@ -184,7 +184,7 @@ def ctx(db, client):
             ),
             {"sid": subject_id, "num": number, "title": title},
         )
-        module_id = str(result.fetchone()["id"])
+        module_id = str(result.mappings().fetchone()["id"])
         db.commit()
         return {"module_id": module_id, "subject_id": subject_id,
                 "number": number, "title": title}
@@ -212,7 +212,7 @@ def ctx(db, client):
                 "status": status, "source": source, "cb": faculty_user_id,
             },
         )
-        qid = str(result.fetchone()["id"])
+        qid = str(result.mappings().fetchone()["id"])
         db.commit()
         cleanup["questions"].append(qid)
         return {"question_id": qid, "module_id": module_id, "co_id": co_id,
@@ -249,7 +249,7 @@ def ctx(db, client):
                 "pub": published, "cb": faculty_user_id,
             },
         )
-        quiz_id = str(result.fetchone()["id"])
+        quiz_id = str(result.mappings().fetchone()["id"])
         for idx, qid in enumerate(question_ids or []):
             db.execute(
                 text(

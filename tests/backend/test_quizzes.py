@@ -35,7 +35,7 @@ def test_draft_question_cannot_go_into_quiz(client, ctx):
     try:
         row = conn.execute(
             text("SELECT COUNT(*) AS c FROM quizzes WHERE title = 'Quiz with draft'")
-        ).fetchone()
+        ).mappings().fetchone()
     finally:
         conn.close()
     assert row["c"] == 0

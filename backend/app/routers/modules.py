@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Depends, Body, Path
+from fastapi.responses import JSONResponse
 from sqlalchemy import text
 
 from ..db import get_conn
@@ -30,7 +31,7 @@ def _module_owned(conn, module_id: str, faculty_user_id: str):
             "WHERE m.id = :id AND s.faculty_user_id = :fid"
         ),
         {"id": module_id, "fid": faculty_user_id},
-    ).fetchone()
+    ).mappings().fetchone()
     if row is None:
         raise AppError(404, "NOT_FOUND", "Module not found")
     return row
@@ -47,7 +48,7 @@ def create_module(
     subj = conn.execute(
         text("SELECT id FROM subjects WHERE id = :id AND faculty_user_id = :fid"),
         {"id": id, "fid": faculty["user_id"]},
-    ).fetchone()
+    ).mappings().fetchone()
     if subj is None:
         raise AppError(404, "NOT_FOUND", "Subject not found")
 
@@ -63,8 +64,8 @@ def create_module(
         ),
         {"sid": id, "num": number, "title": title},
     )
-    row = result.fetchone()
-    return _row_to_module(row), 201
+    row = result.mappings().fetchone()
+    return JSONResponse(content=_row_to_module(row), status_code=201)
 
 
 @router.patch("/modules/{id}")
@@ -99,7 +100,7 @@ def update_module(
         ),
         params,
     )
-    row = result.fetchone()
+    row = result.mappings().fetchone()
     if row is None:
         raise AppError(404, "NOT_FOUND", "Module not found")
     return _row_to_module(row)

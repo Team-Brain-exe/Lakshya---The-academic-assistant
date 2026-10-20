@@ -4,6 +4,7 @@ The full quiz/attempt endpoints belong to Arya (contract section 7).
 This file provides just enough to exercise the database approval triggers.
 """
 from fastapi import APIRouter, Depends, Body, Path
+from fastapi.responses import JSONResponse
 from sqlalchemy import text
 
 from ..db import get_conn
@@ -50,7 +51,7 @@ def create_quiz(
             "WHERE m.id = :mid AND s.faculty_user_id = :fid"
         ),
         {"mid": str(module_id), "fid": faculty["user_id"]},
-    ).fetchone()
+    ).mappings().fetchone()
     if mod is None:
         raise AppError(404, "NOT_FOUND", "Module not found")
     subject_id = str(mod["subject_id"])
@@ -70,7 +71,7 @@ def create_quiz(
             "cb": faculty["user_id"],
         },
     )
-    quiz_row = result.fetchone()
+    quiz_row = result.mappings().fetchone()
     quiz_id = str(quiz_row["id"])
 
     # Insert quiz_questions (trigger will reject unapproved questions)
@@ -87,16 +88,16 @@ def create_quiz(
     count = conn.execute(
         text("SELECT COUNT(*) AS c FROM quiz_questions WHERE quiz_id = :qid"),
         {"qid": quiz_id},
-    ).fetchone()
+    ).mappings().fetchone()
 
     result = conn.execute(
         text("SELECT * FROM quizzes WHERE id = :id"),
         {"id": quiz_id},
-    ).fetchone()
+    ).mappings().fetchone()
     # Build response with question_count
     quiz_dict = _row_to_quiz(result)
     quiz_dict["question_count"] = count["c"]
-    return quiz_dict, 201
+    return JSONResponse(content=quiz_dict, status_code=201)
 
 
 @router.post("/quizzes/{id}/questions")
@@ -118,7 +119,7 @@ def add_quiz_question(
             "WHERE q.id = :id AND s.faculty_user_id = :fid"
         ),
         {"id": id, "fid": faculty["user_id"]},
-    ).fetchone()
+    ).mappings().fetchone()
     if quiz is None:
         raise AppError(404, "NOT_FOUND", "Quiz not found")
 
@@ -148,7 +149,7 @@ def publish_quiz(
             "WHERE q.id = :id AND s.faculty_user_id = :fid"
         ),
         {"id": id, "fid": faculty["user_id"]},
-    ).fetchone()
+    ).mappings().fetchone()
     if quiz is None:
         raise AppError(404, "NOT_FOUND", "Quiz not found")
 
@@ -161,7 +162,7 @@ def publish_quiz(
         ),
         {"id": id},
     )
-    published = result.fetchone()
+    published = result.mappings().fetchone()
 
     # Create an event for the quiz
     event_result = conn.execute(
@@ -177,12 +178,12 @@ def publish_quiz(
             "cb": faculty["user_id"],
         },
     )
-    event_id = str(event_result.fetchone()["id"])
+    event_id = str(event_result.mappings().fetchone()["id"])
 
     count = conn.execute(
         text("SELECT COUNT(*) AS c FROM quiz_questions WHERE quiz_id = :qid"),
         {"qid": id},
-    ).fetchone()
+    ).mappings().fetchone()
 
     quiz_dict = _row_to_quiz(published)
     quiz_dict["question_count"] = count["c"]
