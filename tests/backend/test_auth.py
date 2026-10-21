@@ -1,4 +1,5 @@
 """Tests for auth endpoints (section 2 of the contract)."""
+import uuid
 
 
 # ---------------------------------------------------------------------------
@@ -33,13 +34,15 @@ def test_student_wrong_pin_returns_401(client, ctx):
 
 def test_student_login_lowercase_usn_with_spaces(client, ctx):
     """USN is trimmed and uppercased by the server before lookup."""
-    student = ctx.make_student(usn="1AT0CS042", pin="483920")
+    suffix = uuid.uuid4().hex[:6].upper()
+    usn = f"1AT{suffix}"
+    student = ctx.make_student(usn=usn, pin="483920")
     # Send lowercase USN with leading/trailing spaces
-    resp = ctx.login(usn="  1at0cs042  ", pin="483920")
+    resp = ctx.login(usn=f"  {usn.lower()}  ", pin="483920")
     assert resp.status_code == 200
     data = resp.json()
     assert data["role"] == "student"
-    assert data["user"]["usn"] == "1AT0CS042"
+    assert data["user"]["usn"] == usn
 
 
 def test_student_login_nonexistent_user_returns_401(client, ctx):

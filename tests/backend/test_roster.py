@@ -1,6 +1,7 @@
 """Tests for roster CSV upload (section 4 of the contract)."""
 import io
 import json
+import uuid
 
 from sqlalchemy import text
 
@@ -19,7 +20,10 @@ def test_roster_preview_saves_nothing(client, ctx):
     h = ctx.headers(token)
     subj = ctx.make_subject(faculty["user_id"])
 
-    csv = "usn,name,section\n1AT0CS001,Alice A,A\n1AT0CS002,Bob B,A\n"
+    suf = uuid.uuid4().hex[:6].upper()
+    usn1 = f"1AT{suf}01"
+    usn2 = f"1AT{suf}02"
+    csv = f"usn,name,section\n{usn1},Alice A,A\n{usn2},Bob B,A\n"
     resp = client.post(
         f"/subjects/{subj['subject_id']}/roster/preview",
         headers=h,
@@ -38,7 +42,8 @@ def test_roster_preview_saves_nothing(client, ctx):
     conn = get_engine().connect()
     try:
         rows = conn.execute(
-            text("SELECT COUNT(*) AS c FROM students WHERE usn IN ('1AT0CS001','1AT0CS002')")
+            text("SELECT COUNT(*) AS c FROM students WHERE usn IN (:u1, :u2)"),
+            {"u1": usn1, "u2": usn2},
         ).mappings().fetchone()
     finally:
         conn.close()
@@ -52,11 +57,13 @@ def test_roster_preview_bad_row_and_duplicate(client, ctx):
     h = ctx.headers(token)
     subj = ctx.make_subject(faculty["user_id"])
 
+    suf = uuid.uuid4().hex[:6].upper()
+    usn = f"1AT{suf}01"
     csv = (
         "usn,name,section\n"
-        "1AT0CS001,Alice A,A\n"      # valid (row 2)
-        ",Missing Name,A\n"          # bad: empty usn (row 3)
-        "1AT0CS001,Alice Dup,A\n"    # duplicate (row 4)
+        f"{usn},Alice A,A\n"           # valid (row 2)
+        ",Missing Name,A\n"            # bad: empty usn (row 3)
+        f"{usn},Alice Dup,A\n"         # duplicate (row 4)
     )
     resp = client.post(
         f"/subjects/{subj['subject_id']}/roster/preview",
@@ -66,14 +73,14 @@ def test_roster_preview_bad_row_and_duplicate(client, ctx):
     assert resp.status_code == 200
     data = resp.json()
     assert data["total_rows"] == 3
-    # Only first occurrence of 1AT0CS001 is valid
+    # Only first occurrence of usn is valid
     assert len(data["valid"]) == 1
-    assert data["valid"][0]["usn"] == "1AT0CS001"
+    assert data["valid"][0]["usn"] == usn
     # The bad row (empty usn) appears in bad_rows
     assert any("missing usn" in br["reason"].lower() for br in data["bad_rows"])
     # The duplicate appears in duplicates_in_file
     assert len(data["duplicates_in_file"]) == 1
-    assert data["duplicates_in_file"][0]["usn"] == "1AT0CS001"
+    assert data["duplicates_in_file"][0]["usn"] == usn
 
 
 # ---------------------------------------------------------------------------
@@ -86,7 +93,10 @@ def test_roster_confirm_creates_students_and_credentials(client, ctx):
     h = ctx.headers(token)
     subj = ctx.make_subject(faculty["user_id"])
 
-    csv = "usn,name,section\n1AT0CS003,Carol C,A\n1AT0CS004,Dave D,A\n"
+    suf = uuid.uuid4().hex[:6].upper()
+    usn3 = f"1AT{suf}03"
+    usn4 = f"1AT{suf}04"
+    csv = f"usn,name,section\n{usn3},Carol C,A\n{usn4},Dave D,A\n"
     resp = client.post(
         f"/subjects/{subj['subject_id']}/roster",
         headers=h,
@@ -103,6 +113,10 @@ def test_roster_confirm_creates_students_and_credentials(client, ctx):
         assert len(cred["pin"]) == 6
         assert cred["pin"].isdigit()
 
+    # Register USNs for cleanup (students were created by the roster endpoint)
+    for cred in data["credentials"]:
+        ctx.register_usn(cred["usn"])
+
     # Verify the two students can log in with their new PINs
     for cred in data["credentials"]:
         login_resp = client.post("/auth/login", json={"usn": cred["usn"], "pin": cred["pin"]})
@@ -116,7 +130,10 @@ def test_roster_confirm_again_no_duplicates_no_new_pins(client, ctx):
     h = ctx.headers(token)
     subj = ctx.make_subject(faculty["user_id"])
 
-    csv = "usn,name,section\n1AT0CS005,Eve E,A\n1AT0CS006,Frank F,A\n"
+    suf = uuid.uuid4().hex[:6].upper()
+    usn5 = f"1AT{suf}05"
+    usn6 = f"1AT{suf}06"
+    csv = f"usn,name,section\n{usn5},Eve E,A\n{usn6},Frank F,A\n"
 
     # First upload
     resp = client.post(
@@ -129,6 +146,10 @@ def test_roster_confirm_again_no_duplicates_no_new_pins(client, ctx):
     assert data["created_students"] == 2
     assert data["created_enrollments"] == 2
     first_credentials = {c["usn"]: c["pin"] for c in data["credentials"]}
+
+    # Register USNs for cleanup
+    for usn in first_credentials:
+        ctx.register_usn(usn)
 
     # Second upload — same CSV
     resp = client.post(
@@ -155,12 +176,14 @@ def test_roster_existing_student_keeps_pin(client, ctx):
     h = ctx.headers(token)
     subj = ctx.make_subject(faculty["user_id"])
 
-    # Create a student with a known PIN
-    student = ctx.make_student(usn="1AT0CS100", pin="999999")
+    # Create a student with a known PIN and a unique USN
+    suf = uuid.uuid4().hex[:6].upper()
+    usn = f"1AT{suf}00"
+    student = ctx.make_student(usn=usn, pin="999999")
     original_pin = student["pin"]
 
     # Enroll the student via roster with a different PIN provided
-    csv = "usn,name,section,pin\n1AT0CS100,Existing Student,A,111111\n"
+    csv = f"usn,name,section,pin\n{usn},Existing Student,A,111111\n"
     resp = client.post(
         f"/subjects/{subj['subject_id']}/roster",
         headers=h,
@@ -173,11 +196,11 @@ def test_roster_existing_student_keeps_pin(client, ctx):
     assert data["credentials"] == []  # No credentials for existing student
 
     # Original PIN still works
-    login_resp = client.post("/auth/login", json={"usn": "1AT0CS100", "pin": "999999"})
+    login_resp = client.post("/auth/login", json={"usn": usn, "pin": "999999"})
     assert login_resp.status_code == 200
 
     # Old provided PIN does NOT work
-    login_resp = client.post("/auth/login", json={"usn": "1AT0CS100", "pin": "111111"})
+    login_resp = client.post("/auth/login", json={"usn": usn, "pin": "111111"})
     assert login_resp.status_code == 401
 
 
@@ -188,7 +211,9 @@ def test_roster_provided_pin_for_new_student(client, ctx):
     h = ctx.headers(token)
     subj = ctx.make_subject(faculty["user_id"])
 
-    csv = "usn,name,section,pin\n1AT0CS200,Provided Pin,A,424242\n"
+    suf = uuid.uuid4().hex[:6].upper()
+    usn = f"1AT{suf}00"
+    csv = f"usn,name,section,pin\n{usn},Provided Pin,A,424242\n"
     resp = client.post(
         f"/subjects/{subj['subject_id']}/roster",
         headers=h,
@@ -198,11 +223,14 @@ def test_roster_provided_pin_for_new_student(client, ctx):
     data = resp.json()
     assert data["created_students"] == 1
     assert len(data["credentials"]) == 1
-    assert data["credentials"][0]["usn"] == "1AT0CS200"
+    assert data["credentials"][0]["usn"] == usn
     assert data["credentials"][0]["pin"] == "424242"
 
+    # Register USN for cleanup (student was created by the roster endpoint)
+    ctx.register_usn(usn)
+
     # Verify login with provided PIN works
-    login_resp = client.post("/auth/login", json={"usn": "1AT0CS200", "pin": "424242"})
+    login_resp = client.post("/auth/login", json={"usn": usn, "pin": "424242"})
     assert login_resp.status_code == 200
 
 
@@ -213,7 +241,9 @@ def test_roster_preview_with_invalid_csv(client, ctx):
     subj = ctx.make_subject(faculty["user_id"])
 
     # Missing required column "section"
-    csv = "usn,name\n1AT0CS001,Alice A\n"
+    suf = uuid.uuid4().hex[:6].upper()
+    usn = f"1AT{suf}01"
+    csv = f"usn,name\n{usn},Alice A\n"
     resp = client.post(
         f"/subjects/{subj['subject_id']}/roster/preview",
         headers=h,

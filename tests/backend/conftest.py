@@ -79,7 +79,8 @@ def ctx(db, client):
         "quizzes": [],
         "questions": [],
         "subjects": [],
-        "students": [],
+        "students": [],       # student_id (UUID) to delete
+        "usns": [],           # usn strings created by roster/confirm to delete
         "users": [],
         "custom": [],  # (sql, params) — runs first
     }
@@ -130,6 +131,7 @@ def ctx(db, client):
         )
         db.commit()
         cleanup["students"].append(student_id)
+        cleanup["usns"].append(usn)
         return {"student_id": student_id, "usn": usn, "pin": pin, "name": name}
 
     # ---- Subject ----
@@ -272,6 +274,11 @@ def ctx(db, client):
     def headers(token):
         return {"Authorization": f"Bearer {token}"}
 
+    def register_usn(usn):
+        """Register a USN created by the roster endpoint so it gets cleaned up."""
+        if usn and usn not in cleanup["usns"]:
+            cleanup["usns"].append(usn)
+
     # ---- Assemble ----
     factories = types.SimpleNamespace(
         make_faculty=make_faculty,
@@ -284,6 +291,7 @@ def ctx(db, client):
         make_quiz=make_quiz,
         login=login,
         headers=headers,
+        register_usn=register_usn,
     )
 
     yield factories
@@ -317,6 +325,12 @@ def ctx(db, client):
     for sid in reversed(cleanup["students"]):
         try:
             db.execute(text("DELETE FROM students WHERE id = :id"), {"id": sid})
+        except Exception:
+            pass
+    # Also delete students created by roster confirm (tracked by USN)
+    for usn in reversed(cleanup["usns"]):
+        try:
+            db.execute(text("DELETE FROM students WHERE usn = :usn"), {"usn": usn})
         except Exception:
             pass
     # users (faculty) — must be after subjects
