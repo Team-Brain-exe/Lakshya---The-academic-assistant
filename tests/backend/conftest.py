@@ -110,8 +110,8 @@ def ctx(db, client):
 
     # ---- Student ----
     def make_student(usn=None, pin=None):
-        suffix = uuid.uuid4().hex[:8]
-        usn = usn or f"1AT0{suffix[:4]}".upper()
+        suffix = uuid.uuid4().hex[:12]
+        usn = (usn or f"1AT0{suffix}").strip().upper()
         pin = pin or str(secrets.randbelow(900000) + 100000)
         name = f"Student_{suffix}"
         pin_hash = hash_password(pin)
@@ -276,6 +276,7 @@ def ctx(db, client):
 
     def register_usn(usn):
         """Register a USN created by the roster endpoint so it gets cleaned up."""
+        usn = (usn or "").strip().upper()
         if usn and usn not in cleanup["usns"]:
             cleanup["usns"].append(usn)
 
@@ -297,46 +298,61 @@ def ctx(db, client):
     yield factories
 
     # ---- Teardown (reverse FK order) ----
-    # custom cleanup first (e.g., DELETE subjects by faculty_id)
-    for sql, params in cleanup["custom"]:
+    # Reset connection state: if the test body raised a SQL error the
+    # SQLAlchemy connection may be in a "soft rolled-back" state where
+    # further execute() calls fail.  Rolling back first puts it back
+    # into a clean state so the deletes below actually run.
+    try:
+        db.rollback()
+    except Exception:
+        pass
+
+    try:
+        # custom cleanup first (e.g., DELETE subjects by faculty_id)
+        for sql, params in cleanup["custom"]:
+            try:
+                db.execute(text(sql), params)
+            except Exception:
+                pass
+        # quizzes → quiz_questions and quiz_attempts (CASCADE)
+        for qid in reversed(cleanup["quizzes"]):
+            try:
+                db.execute(text("DELETE FROM quizzes WHERE id = :id"), {"id": qid})
+            except Exception:
+                pass
+        # questions (must be after quizzes because quiz_questions.question_id is RESTRICT)
+        for qid in reversed(cleanup["questions"]):
+            try:
+                db.execute(text("DELETE FROM questions WHERE id = :id"), {"id": qid})
+            except Exception:
+                pass
+        # subjects (CASCADE to cos, modules, enrollments)
+        for sid in reversed(cleanup["subjects"]):
+            try:
+                db.execute(text("DELETE FROM subjects WHERE id = :id"), {"id": sid})
+            except Exception:
+                pass
+        # students (CASCADE to enrollments, users)
+        for sid in reversed(cleanup["students"]):
+            try:
+                db.execute(text("DELETE FROM students WHERE id = :id"), {"id": sid})
+            except Exception:
+                pass
+        # Also delete students created by roster confirm (tracked by USN)
+        for usn in reversed(cleanup["usns"]):
+            try:
+                norm_usn = usn.strip().upper()
+                db.execute(text("DELETE FROM students WHERE usn = :usn"), {"usn": norm_usn})
+            except Exception:
+                pass
+        # users (faculty) — must be after subjects
+        for uid in reversed(cleanup["users"]):
+            try:
+                db.execute(text("DELETE FROM users WHERE id = :id"), {"id": uid})
+            except Exception:
+                pass
+    finally:
         try:
-            db.execute(text(sql), params)
+            db.commit()
         except Exception:
-            pass
-    # quizzes → quiz_questions and quiz_attempts (CASCADE)
-    for qid in reversed(cleanup["quizzes"]):
-        try:
-            db.execute(text("DELETE FROM quizzes WHERE id = :id"), {"id": qid})
-        except Exception:
-            pass
-    # questions (must be after quizzes because quiz_questions.question_id is RESTRICT)
-    for qid in reversed(cleanup["questions"]):
-        try:
-            db.execute(text("DELETE FROM questions WHERE id = :id"), {"id": qid})
-        except Exception:
-            pass
-    # subjects (CASCADE to cos, modules, enrollments)
-    for sid in reversed(cleanup["subjects"]):
-        try:
-            db.execute(text("DELETE FROM subjects WHERE id = :id"), {"id": sid})
-        except Exception:
-            pass
-    # students (CASCADE to enrollments, users)
-    for sid in reversed(cleanup["students"]):
-        try:
-            db.execute(text("DELETE FROM students WHERE id = :id"), {"id": sid})
-        except Exception:
-            pass
-    # Also delete students created by roster confirm (tracked by USN)
-    for usn in reversed(cleanup["usns"]):
-        try:
-            db.execute(text("DELETE FROM students WHERE usn = :usn"), {"usn": usn})
-        except Exception:
-            pass
-    # users (faculty) — must be after subjects
-    for uid in reversed(cleanup["users"]):
-        try:
-            db.execute(text("DELETE FROM users WHERE id = :id"), {"id": uid})
-        except Exception:
-            pass
-    db.commit()
+            db.rollback()
