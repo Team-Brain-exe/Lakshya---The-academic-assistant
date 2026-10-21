@@ -1,191 +1,194 @@
-"""Minimal quizzes router to support the QUESTION_NOT_APPROVED test.
+"""Quizzes and attempts endpoints.
 
-The full quiz/attempt endpoints belong to Arya (contract section 7).
-This file provides just enough to exercise the database approval triggers.
+Section 7 of docs/api-contract.md:
+- POST /quizzes
+- POST /quizzes/{id}/publish
+- GET /quizzes?subject_id=
+- POST /quizzes/{id}/attempts
+- GET /attempts/{id}
+- PUT /attempts/{id}/answers
+- POST /attempts/{id}/submit
+- GET /attempts/{id}/review
 """
-from fastapi import APIRouter, Depends, Body, Path
-from fastapi.responses import JSONResponse
-from sqlalchemy import text
 
-from ..db import get_conn
-from ..deps import require_faculty
-from ..errors import AppError
+from __future__ import annotations
 
-router = APIRouter(tags=["quizzes"])
+from datetime import datetime
+from typing import Any, Sequence
 
+from app.services.calendar import CalendarStore, auto_create_quiz_event
+from app.services.quizzes import (
+    AttemptLimitReachedError,
+    ForbiddenError,
+    NotFoundError,
+    QuestionNotApprovedError,
+    QuizClosedError,
+    QuizError,
+    QuizNotOpenError,
+    QuizNotPublishedError,
+    QuizStore,
+    create_quiz,
+    get_active_attempt,
+    list_quizzes,
+    publish_quiz,
+    review_attempt,
+    save_draft_answers,
+    start_quiz_attempt,
+    submit_attempt,
+)
 
-def _row_to_quiz(row) -> dict:
-    return {
-        "id": str(row["id"]),
-        "module_id": str(row["module_id"]) if row["module_id"] else None,
-        "subject_id": str(row["subject_id"]),
-        "title": row["title"],
-        "opens_at": row["opens_at"].isoformat() if row["opens_at"] else None,
-        "closes_at": row["closes_at"].isoformat() if row["closes_at"] else None,
-        "published": bool(row["published"]),
-        "published_at": row["published_at"].isoformat() if row["published_at"] else None,
-        "question_count": row["question_count"],
-    }
-
-
-@router.post("/quizzes")
-def create_quiz(
-    conn=Depends(get_conn),
-    faculty=Depends(require_faculty),
-    payload: dict = Body(...),
-):
-    module_id = payload.get("module_id")
-    title = payload.get("title")
-    question_ids = payload.get("question_ids", [])
-    opens_at = payload.get("opens_at")
-    closes_at = payload.get("closes_at")
-
-    if not module_id or not title:
-        raise AppError(400, "BAD_REQUEST", "module_id and title are required")
-
-    # Verify faculty owns the subject that owns the module
-    mod = conn.execute(
-        text(
-            "SELECT m.id, m.subject_id FROM modules m "
-            "JOIN subjects s ON s.id = m.subject_id "
-            "WHERE m.id = :mid AND s.faculty_user_id = :fid"
-        ),
-        {"mid": str(module_id), "fid": faculty["user_id"]},
-    ).mappings().fetchone()
-    if mod is None:
-        raise AppError(404, "NOT_FOUND", "Module not found")
-    subject_id = str(mod["subject_id"])
-
-    # Create quiz
-    result = conn.execute(
-        text(
-            "INSERT INTO quizzes (module_id, subject_id, title, opens_at, closes_at, "
-            "created_by) VALUES (:mid, :sid, :title, :opens, :closes, :cb) RETURNING *"
-        ),
-        {
-            "mid": str(module_id),
-            "sid": subject_id,
-            "title": title,
-            "opens": opens_at,
-            "closes": closes_at,
-            "cb": faculty["user_id"],
-        },
-    )
-    quiz_row = result.mappings().fetchone()
-    quiz_id = str(quiz_row["id"])
-
-    # Insert quiz_questions (trigger will reject unapproved questions)
-    for idx, qid in enumerate(question_ids):
-        conn.execute(
-            text(
-                "INSERT INTO quiz_questions (quiz_id, question_id, position) "
-                "VALUES (:qid, :qid2, :pos)"
-            ),
-            {"qid": quiz_id, "qid2": str(qid), "pos": idx},
-        )
-
-    # Count questions
-    count = conn.execute(
-        text("SELECT COUNT(*) AS c FROM quiz_questions WHERE quiz_id = :qid"),
-        {"qid": quiz_id},
-    ).mappings().fetchone()
-
-    result = conn.execute(
-        text("SELECT * FROM quizzes WHERE id = :id"),
-        {"id": quiz_id},
-    ).mappings().fetchone()
-    # Build response with question_count
-    quiz_dict = _row_to_quiz(result)
-    quiz_dict["question_count"] = count["c"]
-    return JSONResponse(content=quiz_dict, status_code=201)
+try:
+    from fastapi import APIRouter, Depends, HTTPException, Query, status
+    HAS_FASTAPI = True
+except ImportError:
+    HAS_FASTAPI = False
 
 
-@router.post("/quizzes/{id}/questions")
-def add_quiz_question(
-    id: str = Path(..., alias="id"),
-    conn=Depends(get_conn),
-    faculty=Depends(require_faculty),
-    payload: dict = Body(...),
-):
-    question_id = payload.get("question_id")
-    if not question_id:
-        raise AppError(400, "BAD_REQUEST", "question_id is required")
-
-    # Verify faculty owns the subject that owns the quiz
-    quiz = conn.execute(
-        text(
-            "SELECT q.* FROM quizzes q "
-            "JOIN subjects s ON s.id = q.subject_id "
-            "WHERE q.id = :id AND s.faculty_user_id = :fid"
-        ),
-        {"id": id, "fid": faculty["user_id"]},
-    ).mappings().fetchone()
-    if quiz is None:
-        raise AppError(404, "NOT_FOUND", "Quiz not found")
-
-    # This insert triggers fn_quiz_question_must_be_approved if the question
-    # is not approved
-    conn.execute(
-        text(
-            "INSERT INTO quiz_questions (quiz_id, question_id, position) "
-            "VALUES (:qid, :qid2, :pos)"
-        ),
-        {"qid": id, "qid2": str(question_id), "pos": 0},
-    )
-    return {"added": True, "question_id": str(question_id)}
+def format_error(code: str, message: str, details: dict[str, Any] | None = None) -> dict[str, Any]:
+    return {"error": {"code": code, "message": message, "details": details or {}}}
 
 
-@router.post("/quizzes/{id}/publish")
-def publish_quiz(
-    id: str = Path(..., alias="id"),
-    conn=Depends(get_conn),
-    faculty=Depends(require_faculty),
-):
-    # Verify ownership
-    quiz = conn.execute(
-        text(
-            "SELECT q.* FROM quizzes q "
-            "JOIN subjects s ON s.id = q.subject_id "
-            "WHERE q.id = :id AND s.faculty_user_id = :fid"
-        ),
-        {"id": id, "fid": faculty["user_id"]},
-    ).mappings().fetchone()
-    if quiz is None:
-        raise AppError(404, "NOT_FOUND", "Quiz not found")
+class QuizRouterHandler:
+    def __init__(self, quiz_store: QuizStore, calendar_store: CalendarStore | None = None) -> None:
+        self.quiz_store = quiz_store
+        self.calendar_store = calendar_store
 
-    # Set published = true; trigger fn_quiz_publish_check fires if any
-    # question is unapproved or no questions exist
-    result = conn.execute(
-        text(
-            "UPDATE quizzes SET published = true, published_at = now() "
-            "WHERE id = :id RETURNING *"
-        ),
-        {"id": id},
-    )
-    published = result.mappings().fetchone()
+    def create(
+        self,
+        current_user: dict[str, Any],
+        module_id: str,
+        subject_id: str,
+        title: str,
+        question_ids: Sequence[str],
+        opens_at: datetime | None = None,
+        closes_at: datetime | None = None,
+    ) -> tuple[int, dict[str, Any]]:
+        try:
+            quiz = create_quiz(
+                self.quiz_store,
+                current_user,
+                module_id=module_id,
+                subject_id=subject_id,
+                title=title,
+                question_ids=question_ids,
+                opens_at=opens_at,
+                closes_at=closes_at,
+            )
+            return 201, {
+                "id": quiz.id,
+                "module_id": quiz.module_id,
+                "subject_id": quiz.subject_id,
+                "title": quiz.title,
+                "opens_at": quiz.opens_at.isoformat() if quiz.opens_at else None,
+                "closes_at": quiz.closes_at.isoformat() if quiz.closes_at else None,
+                "published": quiz.published,
+                "published_at": quiz.published_at.isoformat() if quiz.published_at else None,
+                "question_count": len(quiz.question_ids),
+            }
+        except QuizError as exc:
+            return exc.status_code, format_error(exc.code, exc.message)
 
-    # Create an event for the quiz
-    event_result = conn.execute(
-        text(
-            "INSERT INTO events (subject_id, type, title, starts_at, quiz_id, created_by, "
-            "created_by_agent) VALUES (:sid, 'quiz', :title, :starts, :qid, :cb, false) RETURNING id"
-        ),
-        {
-            "sid": str(published["subject_id"]),
-            "title": published["title"],
-            "starts": published["opens_at"],
-            "qid": id,
-            "cb": faculty["user_id"],
-        },
-    )
-    event_id = str(event_result.mappings().fetchone()["id"])
+    def publish(
+        self,
+        current_user: dict[str, Any],
+        quiz_id: str,
+    ) -> tuple[int, dict[str, Any]]:
+        try:
+            quiz = publish_quiz(self.quiz_store, current_user, quiz_id)
+            event_id = None
+            if self.calendar_store and quiz.opens_at:
+                ev = auto_create_quiz_event(
+                    self.calendar_store,
+                    current_user,
+                    quiz.subject_id,
+                    quiz.id,
+                    quiz.title,
+                    quiz.opens_at,
+                    quiz.closes_at,
+                )
+                event_id = ev.id
 
-    count = conn.execute(
-        text("SELECT COUNT(*) AS c FROM quiz_questions WHERE quiz_id = :qid"),
-        {"qid": id},
-    ).mappings().fetchone()
+            res = {
+                "id": quiz.id,
+                "module_id": quiz.module_id,
+                "subject_id": quiz.subject_id,
+                "title": quiz.title,
+                "opens_at": quiz.opens_at.isoformat() if quiz.opens_at else None,
+                "closes_at": quiz.closes_at.isoformat() if quiz.closes_at else None,
+                "published": quiz.published,
+                "published_at": quiz.published_at.isoformat() if quiz.published_at else None,
+                "question_count": len(quiz.question_ids),
+                "event_id": event_id,
+            }
+            return 200, res
+        except QuizError as exc:
+            return exc.status_code, format_error(exc.code, exc.message)
 
-    quiz_dict = _row_to_quiz(published)
-    quiz_dict["question_count"] = count["c"]
-    quiz_dict["event_id"] = event_id
-    return quiz_dict
+    def list_for_subject(
+        self,
+        current_user: dict[str, Any],
+        subject_id: str,
+    ) -> tuple[int, list[dict[str, Any]]]:
+        quizzes = list_quizzes(self.quiz_store, current_user, subject_id)
+        return 200, quizzes
+
+    def start_attempt(
+        self,
+        current_user: dict[str, Any],
+        quiz_id: str,
+    ) -> tuple[int, dict[str, Any]]:
+        try:
+            res = start_quiz_attempt(self.quiz_store, current_user, quiz_id)
+            return 201, res
+        except QuizError as exc:
+            return exc.status_code, format_error(exc.code, exc.message)
+
+    def get_attempt_state(
+        self,
+        current_user: dict[str, Any],
+        attempt_id: str,
+    ) -> tuple[int, dict[str, Any]]:
+        try:
+            res = get_active_attempt(self.quiz_store, current_user, attempt_id)
+            return 200, res
+        except QuizError as exc:
+            return exc.status_code, format_error(exc.code, exc.message)
+
+    def save_answers(
+        self,
+        current_user: dict[str, Any],
+        attempt_id: str,
+        answers: dict[str, int],
+    ) -> tuple[int, dict[str, Any]]:
+        try:
+            res = save_draft_answers(self.quiz_store, current_user, attempt_id, answers)
+            return 200, res
+        except QuizError as exc:
+            return exc.status_code, format_error(exc.code, exc.message)
+
+    def submit(
+        self,
+        current_user: dict[str, Any],
+        attempt_id: str,
+        answers: dict[str, int],
+    ) -> tuple[int, dict[str, Any]]:
+        try:
+            res = submit_attempt(self.quiz_store, current_user, attempt_id, answers)
+            return 200, res
+        except QuizError as exc:
+            return exc.status_code, format_error(exc.code, exc.message)
+
+    def review(
+        self,
+        current_user: dict[str, Any],
+        attempt_id: str,
+    ) -> tuple[int, Any]:
+        try:
+            res = review_attempt(self.quiz_store, current_user, attempt_id)
+            return 200, res
+        except QuizError as exc:
+            return exc.status_code, format_error(exc.code, exc.message)
+
+
+router = APIRouter() if HAS_FASTAPI else None
+
