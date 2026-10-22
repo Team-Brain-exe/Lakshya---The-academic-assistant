@@ -1,0 +1,25 @@
+services:
+  - type: web
+    name: academic-assistant-api
+    runtime: docker
+    dockerfilePath: Dockerfile
+    plan: free
+    healthCheckPath: /health
+    autoDeploy: true
+    # The login rate limiter (deps.LoginRateLimiter) is in-memory and
+    # therefore only consistent with a single worker.  Do NOT raise
+    # --workers above 1 unless the limiter is replaced with a shared store
+    # (e.g. Redis).
+    envVars:
+      # Required – create these as Render secrets before the first deploy
+      - key: DATABASE_URL
+        sync: false
+      - key: SESSION_SECRET
+        sync: false
+      - key: FRONTEND_ORIGIN
+        sync: false
+      # Optional – sensible defaults
+      - key: ATTEMPT_RULE
+        value: best
+      - key: MAX_ATTEMPTS
+        value: "2"
