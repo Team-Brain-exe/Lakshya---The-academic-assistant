@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "quiz-drafts.schema.json",
+  "title": "AI quiz drafts",
+  "type": "object",
+  "required": ["questions"],
+  "additionalProperties": false,
+  "properties": {
+    "questions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["stem", "options", "correct_option", "co_number"],
+        "additionalProperties": false,
+        "properties": {
+          "stem": {"type": "string", "minLength": 1},
+          "options": {"type": "array", "minItems": 4, "maxItems": 4, "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+          "correct_option": {"type": "integer", "minimum": 0, "maximum": 3},
+          "co_number": {"type": "integer", "minimum": 1},
+          "explanation": {"type": ["string", "null"]},
+          "difficulty": {"type": ["string", "null"]},
+          "bloom_level": {"type": ["string", "null"]},
+          "marks": {"type": "number", "exclusiveMinimum": 0}
+        }
+      }
+    }
+  }
+}
