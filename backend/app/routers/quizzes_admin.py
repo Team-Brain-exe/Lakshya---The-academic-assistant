@@ -10,6 +10,7 @@ from sqlalchemy import text
 from ..db import get_conn
 from ..deps import require_faculty, get_current_user
 from ..errors import AppError
+from ..engine.settings import load_grading_settings
 
 router = APIRouter(tags=["quizzes"])
 
@@ -235,7 +236,9 @@ def _quiz_visible_query(current_user: dict, module_id: str | None,
         )
     else:
         sql = (
-            "SELECT q.*, COUNT(qq.question_id) AS question_count "
+            "SELECT q.*, COUNT(DISTINCT qq.question_id) AS question_count, "
+            "(SELECT COUNT(*) FROM quiz_attempts qa "
+            "WHERE qa.quiz_id = q.id AND qa.student_id = :sid) AS attempt_count "
             "FROM quizzes q "
             "JOIN enrollments e ON e.subject_id = q.subject_id "
             f"LEFT JOIN quiz_questions qq ON qq.quiz_id = q.id "
@@ -260,8 +263,16 @@ def list_quizzes(
     """
     sql, params = _quiz_visible_query(current_user, module_id, subject_id)
     rows = conn.execute(text(sql), params).mappings().fetchall()
-    return [_row_to_quiz(r) | {"question_count": r["question_count"]}
-            for r in rows]
+    results = []
+    for r in rows:
+        item = _row_to_quiz(r) | {"question_count": r["question_count"]}
+        if current_user["role"] == "student":
+            attempt_count = r.get("attempt_count", 0) if hasattr(r, "get") else (r["attempt_count"] if "attempt_count" in r else 0)
+            max_att = load_grading_settings().max_attempts
+            item["attempts_used"] = attempt_count or 0
+            item["attempts_left"] = max(0, max_att - (attempt_count or 0))
+        results.append(item)
+    return results
 
 
 @router.get("/quizzes/{id}")
