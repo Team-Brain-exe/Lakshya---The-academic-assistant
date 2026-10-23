@@ -44,7 +44,7 @@ def create_token(
     payload = {
         "sub": user_id,
         "role": role,
-        "iat": now,
+        "iat": int(now.timestamp()),
         "exp": now + timedelta(hours=TOKEN_EXPIRY_HOURS),
     }
     if student_id is not None:
@@ -56,4 +56,4 @@ def create_token(
 
 def decode_token(token: str) -> dict:
     """Decode and validate a JWT. Raises jwt.InvalidTokenError on failure."""
-    return jwt.decode(token, SESSION_SECRET, algorithms=[_ALGORITHM])
+    return jwt.decode(token, SESSION_SECRET, algorithms=[_ALGORITHM], leeway=10)
