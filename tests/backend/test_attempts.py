@@ -184,6 +184,8 @@ def test_submit_grades_correct_answers(client, ctx, db):
     finally:
         conn.close()
     assert len(rows) == 2
+    for row in rows:
+        assert row["counted"] is True
 
 
 def test_submit_partial_scores(client, ctx, db):
@@ -379,3 +381,159 @@ def test_quiz_list_shows_attempts_used_and_left(client, ctx, db):
     quiz3 = next(q for q in resp3.json() if q["id"] == setup["quiz_id"])
     assert quiz3["attempts_used"] == 2
     assert quiz3["attempts_left"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Attempt rule (ATTEMPT_RULE=best) — counted flag tests
+# ---------------------------------------------------------------------------
+
+def _wrong_answers(q_ids, correct):
+    """Return answers that are all wrong (shift by 2 modulo 4)."""
+    return {q_ids[i]: (correct[q_ids[i]] + 2) % 4 for i in range(len(q_ids))}
+
+
+def _query_co_scores(conn, student_id, subject_id):
+    """Return list of (attempt_id, co_id_str, counted) for a student+subject."""
+    rows = conn.execute(
+        text(
+            "SELECT attempt_id, co_id, counted "
+            "FROM student_co_scores "
+            "WHERE student_id = :sid AND subject_id = :subj "
+            "ORDER BY attempt_id, co_id"
+        ),
+        {"sid": student_id, "subj": subject_id},
+    ).mappings().fetchall()
+    return [(str(r["attempt_id"]), str(r["co_id"]), bool(r["counted"])) for r in rows]
+
+
+def test_attempt_rule_best_counts_second_when_higher(client, ctx, db):
+    """Attempt 1 low, attempt 2 higher → attempt 2 counted, attempt 1 not."""
+    faculty = ctx.make_faculty()
+    student = ctx.make_student()
+    setup = _make_published_open_quiz(db, ctx, faculty)
+    ctx.make_enrollment(student["student_id"], setup["subject_id"])
+
+    token = ctx.login(usn=student["usn"], pin=student["pin"]).json()["access_token"]
+    h = ctx.headers(token)
+
+    # Attempt 1 — all wrong (score = 0)
+    aid1, q_ids = _start_attempt(client, h, setup["quiz_id"])
+    _submit(client, h, aid1, _wrong_answers(q_ids, setup["correct"]))
+
+    # Attempt 2 — all correct (score = 2)
+    correct = {qk: setup["correct"][qk] for qk in setup["question_keys"]}
+    aid2, _ = _start_attempt(client, h, setup["quiz_id"])
+    _submit(client, h, aid2, correct)
+
+    conn = get_engine().connect()
+    try:
+        rows = _query_co_scores(conn, student["student_id"], setup["subject_id"])
+    finally:
+        conn.close()
+
+    a1_scores = [(aid, co, cnt) for (aid, co, cnt) in rows if aid == aid1]
+    a2_scores = [(aid, co, cnt) for (aid, co, cnt) in rows if aid == aid2]
+    assert len(a1_scores) == 2  # one per CO
+    assert len(a2_scores) == 2
+    assert all(not cnt for (_, _, cnt) in a1_scores)  # attempt 1 not counted
+    assert all(cnt for (_, _, cnt) in a2_scores)      # attempt 2 counted
+
+
+def test_attempt_rule_best_counts_first_when_higher(client, ctx, db):
+    """Attempt 1 high, attempt 2 lower → attempt 1 stays counted, attempt 2 not."""
+    faculty = ctx.make_faculty()
+    student = ctx.make_student()
+    setup = _make_published_open_quiz(db, ctx, faculty)
+    ctx.make_enrollment(student["student_id"], setup["subject_id"])
+
+    token = ctx.login(usn=student["usn"], pin=student["pin"]).json()["access_token"]
+    h = ctx.headers(token)
+
+    # Attempt 1 — all correct (score = 2)
+    correct = {qk: setup["correct"][qk] for qk in setup["question_keys"]}
+    aid1, q_ids = _start_attempt(client, h, setup["quiz_id"])
+    _submit(client, h, aid1, correct)
+
+    # Attempt 2 — all wrong (score = 0)
+    aid2, _ = _start_attempt(client, h, setup["quiz_id"])
+    _submit(client, h, aid2, _wrong_answers(q_ids, setup["correct"]))
+
+    conn = get_engine().connect()
+    try:
+        rows = _query_co_scores(conn, student["student_id"], setup["subject_id"])
+    finally:
+        conn.close()
+
+    a1_scores = [(aid, co, cnt) for (aid, co, cnt) in rows if aid == aid1]
+    a2_scores = [(aid, co, cnt) for (aid, co, cnt) in rows if aid == aid2]
+    assert len(a1_scores) == 2
+    assert len(a2_scores) == 2
+    assert all(cnt for (_, _, cnt) in a1_scores)      # attempt 1 counted (higher score)
+    assert all(not cnt for (_, _, cnt) in a2_scores)  # attempt 2 not counted
+
+
+def test_single_submitted_attempt_is_counted(client, ctx, db):
+    """After one submitted attempt, all its student_co_scores rows are counted=True."""
+    faculty = ctx.make_faculty()
+    student = ctx.make_student()
+    setup = _make_published_open_quiz(db, ctx, faculty)
+    ctx.make_enrollment(student["student_id"], setup["subject_id"])
+
+    token = ctx.login(usn=student["usn"], pin=student["pin"]).json()["access_token"]
+    h = ctx.headers(token)
+
+    correct = {qk: setup["correct"][qk] for qk in setup["question_keys"]}
+    aid, _ = _start_attempt(client, h, setup["quiz_id"])
+    _submit(client, h, aid, correct)
+
+    conn = get_engine().connect()
+    try:
+        rows = conn.execute(
+            text(
+                "SELECT attempt_id, co_id, counted "
+                "FROM student_co_scores WHERE attempt_id = :aid"
+            ),
+            {"aid": aid},
+        ).mappings().fetchall()
+    finally:
+        conn.close()
+    assert len(rows) == 2
+    assert all(bool(r["counted"]) for r in rows)
+
+
+def test_exactly_one_counted_per_co_across_attempts(client, ctx, db):
+    """For every (student_id, co_id), exactly one row has counted=true."""
+    faculty = ctx.make_faculty()
+    student = ctx.make_student()
+    setup = _make_published_open_quiz(db, ctx, faculty)
+    ctx.make_enrollment(student["student_id"], setup["subject_id"])
+
+    token = ctx.login(usn=student["usn"], pin=student["pin"]).json()["access_token"]
+    h = ctx.headers(token)
+
+    correct = {qk: setup["correct"][qk] for qk in setup["question_keys"]}
+
+    # Attempt 1 — all correct
+    aid1, q_ids = _start_attempt(client, h, setup["quiz_id"])
+    _submit(client, h, aid1, correct)
+
+    # Attempt 2 — all wrong
+    aid2, _ = _start_attempt(client, h, setup["quiz_id"])
+    _submit(client, h, aid2, _wrong_answers(q_ids, setup["correct"]))
+
+    conn = get_engine().connect()
+    try:
+        rows = _query_co_scores(conn, student["student_id"], setup["subject_id"])
+    finally:
+        conn.close()
+
+    # Group by co_id: for each CO, exactly one attempt should be counted
+    from collections import defaultdict
+    by_co: dict[str, list[bool]] = defaultdict(list)
+    for (_, co_id, counted) in rows:
+        by_co[co_id].append(counted)
+
+    assert len(by_co) == 2  # two COs
+    for co_id, counted_list in by_co.items():
+        assert len(counted_list) == 2  # two attempts
+        assert counted_list.count(True) == 1  # exactly one counted

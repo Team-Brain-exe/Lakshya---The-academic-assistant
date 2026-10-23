@@ -263,12 +263,12 @@ def list_quizzes(
     """
     sql, params = _quiz_visible_query(current_user, module_id, subject_id)
     rows = conn.execute(text(sql), params).mappings().fetchall()
+    max_att = load_grading_settings().max_attempts
     results = []
     for r in rows:
         item = _row_to_quiz(r) | {"question_count": r["question_count"]}
         if current_user["role"] == "student":
-            attempt_count = r.get("attempt_count", 0) if hasattr(r, "get") else (r["attempt_count"] if "attempt_count" in r else 0)
-            max_att = load_grading_settings().max_attempts
+            attempt_count = r["attempt_count"]
             item["attempts_used"] = attempt_count or 0
             item["attempts_left"] = max(0, max_att - (attempt_count or 0))
         results.append(item)
