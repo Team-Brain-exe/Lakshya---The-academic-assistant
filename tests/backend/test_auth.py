@@ -1,6 +1,13 @@
 """Tests for auth endpoints (section 2 of the contract)."""
 import uuid
 
+import jwt
+from datetime import datetime, timezone, timedelta
+from sqlalchemy import text
+
+from backend.app.config import SESSION_SECRET
+from backend.app.security import _ALGORITHM
+
 
 # ---------------------------------------------------------------------------
 # Student login
@@ -151,3 +158,63 @@ def test_expired_or_invalid_token_returns_401(client, ctx):
     headers = {"Authorization": "Bearer garbage.token.here"}
     resp = client.get("/subjects", headers=headers)
     assert resp.status_code == 401
+    assert resp.json()["error"]["code"] == "UNAUTHENTICATED"
+
+
+# ---------------------------------------------------------------------------
+# Token time-window tolerance (leeway=10s)
+# ---------------------------------------------------------------------------
+
+def _make_token(sub, student_id, usn, iat, exp):
+    return jwt.encode(
+        {
+            "sub": sub,
+            "role": "student",
+            "student_id": student_id,
+            "usn": usn,
+            "iat": iat,
+            "exp": exp,
+        },
+        SESSION_SECRET,
+        algorithm=_ALGORITHM,
+    )
+
+
+def test_token_with_iat_3_seconds_in_future_accepted(client, ctx, db):
+    """iat 3s ahead of the clock should be accepted (leeway=10s)."""
+    student = ctx.make_student()
+    user_id = str(
+        db.execute(
+            text("SELECT id FROM users WHERE student_id = :sid"),
+            {"sid": student["student_id"]},
+        )
+        .mappings()
+        .fetchone()["id"]
+    )
+    now = datetime.now(timezone.utc)
+    token = _make_token(
+        sub=user_id,
+        student_id=student["student_id"],
+        usn=student["usn"],
+        iat=now + timedelta(seconds=3),
+        exp=now + timedelta(hours=8),
+    )
+    resp = client.get("/auth/me", headers=ctx.headers(token))
+    assert resp.status_code == 200
+    assert resp.json()["role"] == "student"
+
+
+def test_token_with_exp_in_past_rejected(client, ctx):
+    """exp 60s in the past is beyond the 10s leeway — rejected with 401."""
+    student = ctx.make_student()
+    now = datetime.now(timezone.utc)
+    token = _make_token(
+        sub=student["student_id"],
+        student_id=student["student_id"],
+        usn=student["usn"],
+        iat=now - timedelta(hours=9),
+        exp=now - timedelta(seconds=60),
+    )
+    resp = client.get("/auth/me", headers=ctx.headers(token))
+    assert resp.status_code == 401
+    assert resp.json()["error"]["code"] == "UNAUTHENTICATED"
