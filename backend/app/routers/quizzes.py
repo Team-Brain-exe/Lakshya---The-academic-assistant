@@ -136,9 +136,11 @@ class QuizRouterHandler:
         self,
         current_user: dict[str, Any],
         quiz_id: str,
+        *,
+        now: datetime | None = None,
     ) -> tuple[int, dict[str, Any]]:
         try:
-            res = start_quiz_attempt(self.quiz_store, current_user, quiz_id)
+            res = start_quiz_attempt(self.quiz_store, current_user, quiz_id, now=now)
             return 201, res
         except QuizError as exc:
             return exc.status_code, format_error(exc.code, exc.message)

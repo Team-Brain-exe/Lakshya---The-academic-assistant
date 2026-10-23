@@ -1,0 +1,212 @@
+{
+  "version": 1,
+  "tools": [
+    {
+      "name": "get_co_attainment",
+      "description": "Get class attainment percentages by course outcome for a subject and optional section.",
+      "roles": ["faculty"],
+      "mutation": "read_only",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "subject_id": {"type": "string", "minLength": 1},
+          "section": {"type": "string", "minLength": 1}
+        },
+        "required": ["subject_id"],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "find_weak_COs",
+      "description": "Find course outcomes below their configured attainment targets.",
+      "roles": ["faculty"],
+      "mutation": "read_only",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "subject_id": {"type": "string", "minLength": 1},
+          "section": {"type": "string", "minLength": 1}
+        },
+        "required": ["subject_id"],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "get_my_progress",
+      "description": "Get the authenticated student's own CO progress. The student identity comes from the session.",
+      "roles": ["student"],
+      "mutation": "read_only",
+      "parameters": {
+        "type": "object",
+        "properties": {"subject_id": {"type": "string", "minLength": 1}},
+        "required": ["subject_id"],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "get_student_progress",
+      "description": "Get a student's CO progress in a subject. Faculty access is limited to their own subjects.",
+      "roles": ["faculty"],
+      "mutation": "read_only",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "subject_id": {"type": "string", "minLength": 1},
+          "usn": {"type": "string", "minLength": 1}
+        },
+        "required": ["subject_id"],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "export_sheet",
+      "description": "Export a subject CO sheet and return a download link.",
+      "roles": ["faculty"],
+      "mutation": "read_only",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "subject_id": {"type": "string", "minLength": 1},
+          "scope": {"type": "string", "enum": ["module", "semester"]},
+          "module_id": {"type": "string", "minLength": 1},
+          "section": {"type": "string", "minLength": 1}
+        },
+        "required": ["subject_id"],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "generate_quiz",
+      "description": "Generate AI question drafts for faculty review. This tool never approves or publishes questions.",
+      "roles": ["faculty"],
+      "mutation": "draft_review",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "module_id": {"type": "string", "minLength": 1},
+          "co_id": {"type": "string", "minLength": 1},
+          "difficulty": {"type": "string", "enum": ["easy", "medium", "hard"]},
+          "count": {"type": "integer", "minimum": 1, "maximum": 20}
+        },
+        "required": ["module_id", "co_id", "difficulty", "count"],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "answer_course_question",
+      "description": "Answer a student's question using retrieved course material and slide citations; refuse if nothing supports an answer.",
+      "roles": ["student"],
+      "mutation": "read_only",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "subject_id": {"type": "string", "minLength": 1},
+          "question": {"type": "string", "minLength": 1, "maxLength": 4000}
+        },
+        "required": ["subject_id", "question"],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "suggest_study_plan",
+      "description": "Build a study plan suggestion from the authenticated student's own progress and course material; do not save it.",
+      "roles": ["student"],
+      "mutation": "read_only",
+      "parameters": {
+        "type": "object",
+        "properties": {"subject_id": {"type": "string", "minLength": 1}},
+        "required": ["subject_id"],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "get_flashcards",
+      "description": "Retrieve flashcards for a module the authenticated user is allowed to access.",
+      "roles": ["student", "faculty"],
+      "mutation": "read_only",
+      "parameters": {
+        "type": "object",
+        "properties": {"module_id": {"type": "string", "minLength": 1}},
+        "required": ["module_id"],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "get_module_notes",
+      "description": "Retrieve generated notes for a module the authenticated user is allowed to access.",
+      "roles": ["student", "faculty"],
+      "mutation": "read_only",
+      "parameters": {
+        "type": "object",
+        "properties": {"module_id": {"type": "string", "minLength": 1}},
+        "required": ["module_id"],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "generate_study_material",
+      "description": "Generate flashcard and note drafts for faculty review; do not publish or expose them before review.",
+      "roles": ["faculty"],
+      "mutation": "draft_review",
+      "parameters": {
+        "type": "object",
+        "properties": {"module_id": {"type": "string", "minLength": 1}},
+        "required": ["module_id"],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "list_events",
+      "description": "List events visible to the authenticated user for a subject and time range.",
+      "roles": ["student", "faculty"],
+      "mutation": "read_only",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "subject_id": {"type": "string", "minLength": 1},
+          "from": {"type": "string", "format": "date-time"},
+          "to": {"type": "string", "format": "date-time"}
+        },
+        "required": ["subject_id"],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "propose_schedule_event",
+      "description": "Propose a new calendar event. This tool only creates a proposal; it must not save the event.",
+      "roles": ["faculty"],
+      "mutation": "confirm",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "subject_id": {"type": "string", "minLength": 1},
+          "section": {"type": ["string", "null"]},
+          "type": {"type": "string", "enum": ["quiz", "assignment", "exam", "teaching", "custom"]},
+          "title": {"type": "string", "minLength": 1, "maxLength": 200},
+          "starts_at": {"type": "string", "format": "date-time"},
+          "ends_at": {"type": ["string", "null"], "format": "date-time"},
+          "quiz_id": {"type": ["string", "null"]},
+          "module_id": {"type": ["string", "null"]}
+        },
+        "required": ["subject_id", "type", "title", "starts_at"],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "propose_move_event",
+      "description": "Propose moving an existing calendar event. This tool only creates a proposal; it must not update the event.",
+      "roles": ["faculty"],
+      "mutation": "confirm",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "event_id": {"type": "string", "minLength": 1},
+          "starts_at": {"type": "string", "format": "date-time"},
+          "ends_at": {"type": ["string", "null"], "format": "date-time"}
+        },
+        "required": ["event_id", "starts_at"],
+        "additionalProperties": false
+      }
+    }
+  ]
+}

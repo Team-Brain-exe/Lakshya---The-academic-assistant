@@ -1,3 +1,12 @@
+import sys
+from pathlib import Path
+
+# The shared AI package lives at the repository root, while the existing launch
+# command runs with `backend/` as the working directory.
+_REPO_ROOT = str(Path(__file__).resolve().parents[2])
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.exceptions import RequestValidationError
@@ -11,7 +20,8 @@ from .errors import (
     integrity_error_handler,
     unexpected_exception_handler,
 )
-from .routers import auth, subjects, modules, roster, questions, health, quizzes, quizzes_admin
+from .routers import auth, subjects, modules, roster, questions, health, quizzes, quizzes_admin, agent
+from .services.agent_runtime import close_agent_runtime, configure_agent_runtime
 
 
 app = FastAPI(
@@ -53,7 +63,13 @@ routers = [
     questions.router,
     quizzes_admin.router,  # restored from 8b266dd — full quiz/create/publish endpoints
     quizzes.router,        # minimal — full implementation is Arya's section 7
+    agent.router,          # role-scoped agent; handlers are injected by the runtime bootstrap
 ]
 
 for r in routers:
     app.include_router(r)
+
+# Agent routes stay disabled until the HTTPS provider and task-specific models
+# are configured in .env. Tool contracts still omit any unimplemented handlers.
+configure_agent_runtime(app)
+app.router.add_event_handler("shutdown", lambda: close_agent_runtime(app))

@@ -41,6 +41,8 @@ class TokenFactoryClient:
         if (
             parsed_url.scheme.lower() != "https"
             or not parsed_url.netloc
+            or parsed_url.username is not None
+            or parsed_url.password is not None
             or parsed_url.query
             or parsed_url.fragment
         ):

@@ -13,11 +13,25 @@ An academic assistant for faculty and students. Faculty upload slides; the syste
 3. **AI generates, humans approve.** No generated question reaches a student before faculty approval.
 4. **The agent works through tools** over structured data and is role-scoped: a student's agent only reads that student's data.
 
+## How we use NVIDIA Nemotron, Token Factory and Nebius
+
+AI features are designed to use the HTTPS OpenAI-compatible Token Factory client. The API key stays in the local `.env` file and is never committed. Model IDs are configured in the environment only after the team evaluates quality, latency, and token usage. **No model IDs have been selected yet** because Token Factory credentials and slide decks were not available in this checkout; see `notes/feedback-log.md` and `ai/README.md` for the evaluation commands.
+
+| Task | Candidate model | Why / where it runs |
+| --- | --- | --- |
+| CO tagging of slide chunks | Nemotron Nano (evaluation pending) | Lower-cost tagging pass during module upload, once per module |
+| Quiz, flashcard, and note draft generation | Nemotron Super (evaluation pending) | Stronger generation; all questions remain drafts for faculty review |
+| Agent chat and tool calling | Nemotron Super (evaluation pending) | Role-scoped tool use with a six-step cap and confirmation-gated writes |
+| Hard reasoning, if needed | Nemotron Ultra (evaluation pending) | Reserved for cases where evaluation justifies the additional cost |
+| Grading, CO marks, attainment, and sheets | No AI | Deterministic backend code; an LLM never computes a mark |
+
+No other Nebius services are currently integrated; hosting, Serverless Jobs, or Endpoints remain optional and require a team decision.
+
 ## Repository layout
 
 ```
 backend/   FastAPI app: API, auth, grading, CO math, agent tools
-frontend/  React + Tailwind app
+frontend/  React + Vite app with a small hand-authored design system
 ai/        Token Factory client, prompts, tool schemas (ai/schemas/)
 notes/     Working notes, feedback-log.md
 docs/      API contract, decisions, team plan
