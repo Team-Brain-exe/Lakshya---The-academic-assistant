@@ -11,7 +11,7 @@ from .errors import (
     integrity_error_handler,
     unexpected_exception_handler,
 )
-from .routers import auth, subjects, modules, roster, questions, health, quizzes, quizzes_admin
+from .routers import auth, subjects, modules, roster, questions, health, quizzes, quizzes_admin, attempts
 
 
 app = FastAPI(
@@ -53,6 +53,7 @@ routers = [
     questions.router,
     quizzes_admin.router,  # restored from 8b266dd — full quiz/create/publish endpoints
     quizzes.router,        # minimal — full implementation is Arya's section 7
+    attempts.router,       # section 7 — attempt start, resume, save, submit, review
 ]
 
 for r in routers:
