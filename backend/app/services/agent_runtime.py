@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable
+from functools import partial
 from typing import Any
 
 from ai.config import AIConfig, AIConfigurationError
@@ -10,14 +11,21 @@ from ai.tool_contracts import build_tool_registry
 from sqlalchemy import text
 
 from .agent_api import build_postgres_agent_handler_factory, install_agent_handler_factory
+from .agent_dev_stores import build_dev_analytics_store, validate_dev_store_config
 
 
-def build_agent_tool_registry(connection: Any):
+def build_agent_tool_registry(
+    connection: Any,
+    analytics_store_factory: Callable[[Any], Any] | None = None,
+):
     """Bind only implemented, server-authorized tools to the shared contracts.
 
     The quiz handler verifies faculty ownership of both the module and CO before
-    generation and persists every question as an AI draft. Other contracts stay
-    hidden until their production adapters are available.
+    generation and persists every question as an AI draft.
+
+    The analytics tools take an AnalyticsStore, not a database connection. They are
+    bound only when ``analytics_store_factory(connection)`` returns a store. Without
+    one, they stay hidden from the model.
     """
     from .. import agent_tools
 
@@ -31,7 +39,39 @@ def build_agent_tool_registry(connection: Any):
             }]
         }
 
-    return build_tool_registry({"generate_quiz": generate_quiz_drafts})
+    handlers: dict[str, Callable[[dict[str, Any], dict[str, Any]], Any]] = {
+        "generate_quiz": generate_quiz_drafts,
+    }
+
+    if analytics_store_factory is not None:
+        store = analytics_store_factory(connection)
+        if store is not None:
+            _bind_analytics_tools(handlers, agent_tools, store)
+
+    return build_tool_registry(handlers)
+
+
+def _bind_analytics_tools(handlers: dict[str, Any], agent_tools: Any, store: Any) -> None:
+    """Pass the server-held store as the third argument. The model never chooses it."""
+
+    def bind(tool_fn, args_model, shape):
+        def handler(args: dict[str, Any], current_user: dict[str, Any]) -> Any:
+            validated = args_model.model_validate(args)
+            return shape(tool_fn(validated, current_user, store))
+        return handler
+
+    handlers["find_weak_COs"] = bind(
+        agent_tools.find_weak_COs, agent_tools.FindWeakCOsArgs,
+        lambda rows: {"weak_cos": rows},
+    )
+    handlers["get_co_attainment"] = bind(
+        agent_tools.get_co_attainment, agent_tools.GetCOAttainmentArgs,
+        lambda rows: {"cos": rows},
+    )
+    handlers["get_student_progress"] = bind(
+        agent_tools.get_student_progress, agent_tools.GetStudentProgressArgs,
+        lambda result: result,
+    )
 
 
 def _execute_usage_insert(connection: Any, statement: str, parameters: dict[str, Any]) -> None:
@@ -102,6 +142,7 @@ def configure_agent_runtime(app: Any, *, config: AIConfig | None = None) -> bool
     Without a Token Factory key, HTTPS base URL, agent model, and generation
     model, the app remains importable and the route returns AGENT_NOT_CONFIGURED.
     """
+    validate_dev_store_config()  # fails at startup if dev-only data is enabled in production
     settings = config or AIConfig.from_env()
     try:
         model = settings.model_for("agent")
@@ -113,7 +154,10 @@ def configure_agent_runtime(app: Any, *, config: AIConfig | None = None) -> bool
     factory = build_postgres_agent_handler_factory(
         client,
         model=model,
-        tool_registry_factory=build_agent_tool_registry,
+        tool_registry_factory=partial(
+            build_agent_tool_registry,
+            analytics_store_factory=build_dev_analytics_store,
+        ),
         usage_recorder_factory=agent_usage_recorder_factory,
         tool_usage_recorder_factory=tool_usage_recorder_factory,
     )
