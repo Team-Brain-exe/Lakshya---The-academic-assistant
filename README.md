@@ -29,24 +29,38 @@ render.yaml Render Blueprint definition
 
 ## Setup
 
-Prerequisites: Python 3.12+, Node 18+, a Supabase Postgres project.
+Prerequisites: Python 3.12+, Node 18+, and a Supabase Postgres project.
 
 ```bash
-git clone <repo-url>
-cd academic-assistant
-cp .env.example .env        # fill in values; never commit .env
-```
-
-Backend:
-
-```bash
-cd backend
+git clone https://github.com/Team-Brain-exe/Lakshya---The-academic-assistant.git
+cd Lakshya---The-academic-assistant
 python -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-uvicorn app.main:app --reload
+pip install -r backend/requirements.txt
+cp .env.example .env        # fill in the values below; never commit .env
 ```
 
-Frontend (TODO):
+Required values in `.env`:
+
+- `DATABASE_URL`: the Supabase **Session pooler** connection string (Connect, then Session pooler). Use a database password of letters and digits only.
+- `SESSION_SECRET`: any long random string, for example `python -c "import secrets; print(secrets.token_urlsafe(48))"`.
+- `FRONTEND_ORIGIN`: `http://localhost:5173` for local development.
+- `TOKEN_FACTORY_*` and `MODEL_*`: only needed for the AI features (quiz generation, tagging, the agent). The app starts without them.
+
+Create the database schema, then a faculty account:
+
+```bash
+python backend/migrations/apply.py
+python backend/scripts/create_faculty.py --help    # shows the arguments for the account
+```
+
+Run the backend and check it:
+
+```bash
+cd backend && uvicorn app.main:app --reload
+curl localhost:8000/health                          # {"status":"ok"}
+```
+
+Frontend (TODO, owner: Arya):
 
 ```bash
 cd frontend
@@ -54,7 +68,7 @@ npm install
 npm run dev
 ```
 
-Seed demo data (TODO):
+Seed demo data (TODO, owner: Arya):
 
 ```bash
 python seed/seed.py
