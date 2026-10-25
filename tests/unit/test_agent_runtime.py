@@ -7,6 +7,7 @@ import pytest
 from ai.config import AIConfigurationError
 
 def test_agent_runtime_installs_only_registered_faculty_tools(monkeypatch):
+    monkeypatch.delenv("AGENT_DEV_IN_MEMORY_STORES", raising=False)    
     from backend.app import agent_tools
     from backend.app.services.agent_runtime import build_agent_tool_registry, configure_agent_runtime
 

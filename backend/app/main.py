@@ -20,7 +20,7 @@ from .errors import (
     integrity_error_handler,
     unexpected_exception_handler,
 )
-from .routers import auth, subjects, modules, roster, questions, health, quizzes, quizzes_admin, agent
+from .routers import auth, subjects, modules, roster, questions, health, quizzes, quizzes_admin, attempts, agent
 from .services.agent_runtime import close_agent_runtime, configure_agent_runtime
 
 
@@ -63,6 +63,7 @@ routers = [
     questions.router,
     quizzes_admin.router,  # restored from 8b266dd — full quiz/create/publish endpoints
     quizzes.router,        # minimal — full implementation is Arya's section 7
+    attempts.router,       # section 7 — attempt start, resume, save, submit, review
     agent.router,          # role-scoped agent; handlers are injected by the runtime bootstrap
 ]
 
