@@ -96,6 +96,29 @@ Grading is the part the pitch depends on, so its unit tests need to be exact. Yo
 - [ ] Log every AI call and every tool call to AgentLog, with the token counts Danwin returns.
 - [ ] Provide the totals per step that Danwin's cost page reads.
 
+## Status (28 Oct 2026)
+
+Checkboxes above are left as written until each item is confirmed on the hosted database. "Tested" means
+the integration tests in `tests/backend/test_arya_integration.py` pass on a local Postgres 16 with migrations
+001 to 003; nothing here has been run on Supabase or Render yet.
+
+| Task | State |
+|---|---|
+| 1 Repo, license, README | Done earlier. README seed and test sections updated. |
+| 2 Seed data | Runner written and tested locally (`python -m seed.seed`). **Not yet run on the hosted database.** |
+| 3 PPT parsing, chunks, coverage | Routes wired to Postgres and tested (upload status transitions, tags, coverage). Tagging was tested with a stub; **real AI tagging untested**. |
+| 4 Grading and CO marks | Unit tests pass. Submission and the `counted` flag are Aparna's code; sheet consistency tested. |
+| 5 Publish and attempts | Done by Aparna (`quizzes_admin.py`, `attempts.py`). Not mine to change. |
+| 6 CO sheet, summary, drill-down, weak CO | Wired and tested, including "change one answer and the sheet moves". |
+| 7 Excel export | Tested against the on-screen sheet. **Format not confirmed with faculty.** |
+| 8 Slide Q&A | Wired with keyword retrieval (see decisions.md #1). Real AI answers untested. |
+| 9 Study plan | Wired and tested. Open question: unattempted COs count as weak (see below). |
+| 10 Flashcards and notes | Wired and tested (slide-text fallback). AI version untested. |
+| 11 Calendar | Wired and tested. Quiz events are created by Aparna's publish. |
+| 12 Usage logging | Wired and tested with a fake client. Real token counts untested. |
+
+Not done: the frontend API client and screens, the submission work, and anything on the hosted environment.
+
 ## Submission work (outside the points)
 
 - Write the project description. Name the track (Best Apps and Agents) and say where Nemotron, Token Factory and Nebius are used.
@@ -114,6 +137,8 @@ Grading is the part the pitch depends on, so its unit tests need to be exact. Yo
 | Excel format the university uses | You |
 | Retrieval for slide Q&A: pgvector or in-memory | Danwin and you, in the first build |
 | Who keeps the demo URL up through judging | Aparna |
+| Who owns the frontend API client and the screens (tasks 8 to 13)? `aparna.md`, `danwin.md` and Aparna's message disagree, see `docs/arya-integration-notes.md` | Whole team |
+| Should a study plan include COs the student has not been assessed on yet? Today it does | Faculty and team |
 
 ## Hand-offs
 

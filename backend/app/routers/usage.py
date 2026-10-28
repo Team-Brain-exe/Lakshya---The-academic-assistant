@@ -39,5 +39,22 @@ class UsageRouterHandler:
         return 200, summary
 
 
-router = APIRouter() if HAS_FASTAPI else None
+# ---------------------------------------------------------------------------
+# Live route (Postgres)
+# ---------------------------------------------------------------------------
 
+from ..db import get_conn
+from ..deps import require_faculty
+from ..pg.usage import PostgresUsageStore
+
+router = APIRouter(tags=["usage"])
+
+
+@router.get("/usage/summary")
+def usage_summary(
+    from_: datetime | None = Query(None, alias="from"),
+    to: datetime | None = None,
+    conn=Depends(get_conn),
+    user=Depends(require_faculty),
+):
+    return PostgresUsageStore(conn).summary(from_, to)

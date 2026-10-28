@@ -52,9 +52,22 @@ class ChunkRetrievalStore(Protocol):
     ) -> list[RetrievalChunk]: ...
 
 
+_STOPWORDS = frozenset(
+    "a an and are as at be but by can do does for from how i if in into is it its me my "
+    "of on or so than that the their them then there these they this to us was we were "
+    "what when where which who why will with you your explain define describe tell about "
+    "give please difference between meaning".split()
+)
+
+
 def _tokenize(text: str) -> list[str]:
-    """Tokenize and normalize words, dropping punctuation."""
-    return re.findall(r"\b[a-zA-Z0-9_-]{2,}\b", text.lower())
+    """Tokenize and normalize words, dropping punctuation and question filler words."""
+    words = re.findall(r"\b[a-zA-Z0-9_-]{2,}\b", text.lower())
+    return [w for w in words if w not in _STOPWORDS]
+
+
+class NotInSlidesError(Exception):
+    """The AI client says the retrieved slides do not answer the question."""
 
 
 class InMemoryChunkRetrievalStore:
@@ -183,8 +196,12 @@ def answer_from_course_material(
     if ai_client is not None:
         try:
             answer_text = ai_client(question, context_str)
-        except Exception:
-            # Fall back cleanly if AI call fails
+        except Exception as exc:
+            # The name check also matches when this module was imported under two
+            # package names (as the test suite does), where isinstance would miss.
+            if isinstance(exc, NotInSlidesError) or type(exc).__name__ == "NotInSlidesError":
+                return QAResult(answer=REFUSAL_MESSAGE, citations=[], refused=True)
+            # Fall back cleanly if the AI call fails
             answer_text = f"Based on the slides:\n{context_blocks[0]}"
     else:
         # Grounded fallback: return summary citing the highest-scoring slide
