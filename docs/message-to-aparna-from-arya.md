@@ -4,9 +4,9 @@
 
 Hi Aparna,
 
-I pulled `main` and read your message. My part is on a branch, ready for you to review. All numbers below are from a local Postgres 16 with migrations 001 to 003. **I have not run any of it on the shared Supabase database or on Render, so please don't treat integration as verified until we do.**
+My backend integration work is pushed to `main` in commit `42c57b3`. All test results below are from local PostgreSQL 16 with migrations 001 to 003. **I have not run this work against the shared Supabase database or Render, so hosted integration is not yet verified.**
 
-## What is on my branch
+## What I pushed to main
 
 - The five unwired routers now have real routes: `upload.py`, `co_sheet.py`, `study.py`, `calendar.py`, `usage.py`. Postgres stores are in a new package, `backend/app/pg/`.
 - `main.py`: five lines, added after `attempts.router`, as you suggested. I am the only one touching those lines.
@@ -44,7 +44,7 @@ Not confirmed, so I used the fallback paths. With no key, tagging leaves chunks 
 
 - Run the tests on the hosted database, and fix whatever they find.
 - The frontend API client and screens, once ownership is agreed.
-- Submission work: description, requirement-mapping table, feedback notes. I propose we agree who records and edits the video once the demo runs.
+- Submission draft: `docs/submission-draft.md` is prepared; the organisers' official must-have list and external confirmations are still needed. I propose we agree who records and edits the video once the demo runs.
 
 Thanks,
 Arya

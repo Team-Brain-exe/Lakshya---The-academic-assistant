@@ -13,7 +13,7 @@ After the runs, only the seed rows remained (the tests removed their own).
 ## Environment
 - PostgreSQL 16 on localhost, migrations 001, 002 and 003 applied.
 - Migration 004 was NOT applied: it grants to the Supabase roles `anon` and `authenticated`, which do not exist locally. Those grants are untested.
-- Python 3.12 with `backend/requirements.txt` pinned versions (FastAPI 0.115.6).
+- Python 3.14.5, SQLAlchemy 2.0.36, Psycopg 3.2.10, FastAPI 0.115.6. The full test run completed locally on 28 Oct 2026: 290 passed. The dependency versions used for this run may differ from the pinned project requirements.
 - No Token Factory credentials. AI paths ran on fallbacks, or on a fake client that returns canned text and token counts.
 
 ## What the 29 integration tests cover
