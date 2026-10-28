@@ -1,0 +1,3087 @@
+diff -ruN -x __pycache__ -x node_modules -x '*.pyc' -x .pytest_cache a/README.md ./README.md
+--- a/README.md	2026-10-23 08:36:40.000000000 +0000
++++ ./README.md	2026-10-28 02:37:22.531596692 +0000
+@@ -54,12 +54,17 @@
+ npm run dev
+ ```
+ 
+-Seed demo data (TODO):
++Seed demo data (needs `DATABASE_URL` in `.env`; safe to run twice):
+ 
+ ```bash
+-python seed/seed.py
++python -m seed.seed --yes          # load: 1 subject, 6 COs, 4 modules, 13 slides, 10 approved questions, 60 students, 2 quizzes, 118 attempts
++python -m seed.seed --remove --yes # delete only the rows the seed created
+ ```
+ 
++Demo logins after seeding (all invented): faculty `raman@lakshya.edu` / `Demo@12345`,
++students `1XX23CS001` to `1XX23CS060` with PIN `123456`. The seed prints the target
++database host (never the password) and asks for confirmation unless `--yes` is given.
++
+ ## Backend
+ 
+ ### How grading works (plain code, never an LLM)
+@@ -191,15 +196,23 @@
+ 
+ ```bash
+ pip install -r backend/requirements.txt
+-pytest
++pytest tests/unit                       # no database needed
++pytest tests/backend                    # needs DATABASE_URL and SESSION_SECRET; creates and removes its own rows
++pytest tests/backend/test_arya_integration.py   # Arya's routes: permissions, upload, CO sheet, study, calendar
+ ```
+ 
+-`pytest.ini` points at `backend/` and `tests/`, so no other setup is needed.
++`pytest.ini` points at `backend/` and `tests/`. The backend tests need a database that has migrations
++001 to 003 applied (004 only matters on Supabase). AI-backed paths are tested with a fake client, so
++no Token Factory key is needed to run the suite.
+ 
+ ## Demo data
+ 
+ All demo data is synthetic. Student seat numbers (USNs) are fake. No real student records are in this repository.
+ 
++Seed it with `python -m seed.seed --yes` (see Setup). The seed inserts quizzes as drafts, links their
++approved questions, and only then publishes them, because the database refuses to publish a quiz
++that has no approved questions. It also creates the calendar events and the flashcards and notes.
++
+ ## Hosted demo
+ 
+ TODO: URL (owner: Aparna).
+diff -ruN -x __pycache__ -x node_modules -x '*.pyc' -x .pytest_cache a/backend/app/main.py ./backend/app/main.py
+--- a/backend/app/main.py	2026-10-23 08:36:40.000000000 +0000
++++ ./backend/app/main.py	2026-10-25 10:03:09.924074501 +0000
+@@ -11,7 +11,10 @@
+     integrity_error_handler,
+     unexpected_exception_handler,
+ )
+-from .routers import auth, subjects, modules, roster, questions, health, quizzes, quizzes_admin, attempts
++from .routers import (
++    auth, subjects, modules, roster, questions, health, quizzes, quizzes_admin, attempts,
++    upload, co_sheet, study, calendar, usage,
++)
+ 
+ 
+ app = FastAPI(
+@@ -54,6 +57,11 @@
+     quizzes_admin.router,  # restored from 8b266dd — full quiz/create/publish endpoints
+     quizzes.router,        # minimal — full implementation is Arya's section 7
+     attempts.router,       # section 7 — attempt start, resume, save, submit, review
++    upload.router,         # section 6 — slide upload, status, coverage (Arya)
++    co_sheet.router,       # section 8 — CO sheet, summary, drill-down, export, progress (Arya)
++    study.router,          # section 9 — Q&A, study plan, flashcards, notes (Arya)
++    calendar.router,       # section 10 — events (Arya)
++    usage.router,          # section 12 — token usage summary (Arya)
+ ]
+ 
+ for r in routers:
+diff -ruN -x __pycache__ -x node_modules -x '*.pyc' -x .pytest_cache a/backend/app/pg/__init__.py ./backend/app/pg/__init__.py
+--- a/backend/app/pg/__init__.py	1970-01-01 00:00:00.000000000 +0000
++++ ./backend/app/pg/__init__.py	2026-10-25 09:59:53.667129455 +0000
+@@ -0,0 +1,6 @@
++"""Postgres-backed stores and access helpers for Arya's features.
++
++Everything here talks to the tables in backend/migrations/001_init.sql through a
++SQLAlchemy Connection (one per request, see app.db.get_conn). No ORM.
++Aparna's quiz and attempt store lives in app/stores/ and is not touched.
++"""
+diff -ruN -x __pycache__ -x node_modules -x '*.pyc' -x .pytest_cache a/backend/app/pg/analytics.py ./backend/app/pg/analytics.py
+--- a/backend/app/pg/analytics.py	1970-01-01 00:00:00.000000000 +0000
++++ ./backend/app/pg/analytics.py	2026-10-25 10:00:08.529958042 +0000
+@@ -0,0 +1,178 @@
++"""AnalyticsStore on Postgres: roster, CO config and per-attempt CO scores.
++
++Reads student_co_scores (written by Aparna's submit) and rebuilds one AttemptScore per
++graded attempt. The attempt rule (best, latest or average) is applied in code by
++co_analytics through ATTEMPT_RULE, the same setting Aparna's submit uses to set the
++`counted` flag, so the sheet and the flag agree. Per-question results (needed only for
++the drill-down) are rebuilt by re-grading the stored answers with engine.grading.
++"""
++
++from __future__ import annotations
++
++from collections import defaultdict
++from typing import Any
++
++from sqlalchemy import text
++
++from ..engine.co_math import AttemptScore, COConfig, StudentInfo
++from ..engine.grading import COMarks, QuestionKey, grade_attempt
++from .common import as_uuid, to_float
++
++
++class PostgresAnalyticsStore:
++    def __init__(self, conn: Any) -> None:
++        self.conn = conn
++
++    # -- course outcomes -------------------------------------------------
++
++    def get_subject_cos(self, subject_id: str) -> list[COConfig]:
++        rows = self.conn.execute(
++            text(
++                "SELECT number, threshold_pct, target_attainment_pct "
++                "FROM course_outcomes WHERE subject_id = :sid ORDER BY number"
++            ),
++            {"sid": as_uuid(subject_id, "Subject")},
++        ).fetchall()
++        return [COConfig(int(r[0]), float(r[1]), float(r[2])) for r in rows]
++
++    def get_co_by_id(self, co_id: str) -> COConfig | None:
++        row = self.conn.execute(
++            text(
++                "SELECT number, threshold_pct, target_attainment_pct "
++                "FROM course_outcomes WHERE id = :id"
++            ),
++            {"id": as_uuid(co_id, "Course outcome")},
++        ).fetchone()
++        return COConfig(int(row[0]), float(row[1]), float(row[2])) if row else None
++
++    def co_numbers_to_ids(self, subject_id: str) -> dict[int, str]:
++        rows = self.conn.execute(
++            text("SELECT number, id FROM course_outcomes WHERE subject_id = :sid"),
++            {"sid": as_uuid(subject_id, "Subject")},
++        ).fetchall()
++        return {int(r[0]): str(r[1]) for r in rows}
++
++    # -- people ----------------------------------------------------------
++
++    def get_subject_roster(self, subject_id: str) -> list[StudentInfo]:
++        rows = self.conn.execute(
++            text(
++                "SELECT s.usn, s.name, e.section FROM enrollments e "
++                "JOIN students s ON s.id = e.student_id "
++                "WHERE e.subject_id = :sid ORDER BY s.usn"
++            ),
++            {"sid": as_uuid(subject_id, "Subject")},
++        ).fetchall()
++        return [StudentInfo(usn=r[0], name=r[1], section=r[2]) for r in rows]
++
++    def get_student_by_usn(self, usn: str) -> StudentInfo | None:
++        row = self.conn.execute(
++            text(
++                "SELECT s.usn, s.name, "
++                "(SELECT e.section FROM enrollments e WHERE e.student_id = s.id LIMIT 1) "
++                "FROM students s WHERE s.usn = :usn"
++            ),
++            {"usn": usn.strip().upper()},
++        ).fetchone()
++        return StudentInfo(usn=row[0], name=row[1], section=row[2]) if row else None
++
++    # -- scores ----------------------------------------------------------
++
++    def get_subject_attempts(self, subject_id: str) -> list[AttemptScore]:
++        sid = as_uuid(subject_id, "Subject")
++        rows = self.conn.execute(
++            text(
++                "SELECT s.attempt_id, st.usn, a.quiz_id, a.attempt_number, a.answers, "
++                "       COALESCE(s.module_id, z.module_id) AS module_id, "
++                "       c.number AS co_number, s.marks_obtained, s.max_marks "
++                "FROM student_co_scores s "
++                "JOIN quiz_attempts a ON a.id = s.attempt_id "
++                "JOIN quizzes z ON z.id = a.quiz_id "
++                "JOIN students st ON st.id = s.student_id "
++                "JOIN course_outcomes c ON c.id = s.co_id "
++                "WHERE s.subject_id = :sid AND a.submitted_at IS NOT NULL "
++                "ORDER BY st.usn, a.quiz_id, a.attempt_number, c.number"
++            ),
++            {"sid": sid},
++        ).mappings().fetchall()
++        if not rows:
++            return []
++
++        quiz_ids = sorted({str(r["quiz_id"]) for r in rows})
++        keys_by_quiz = self._question_keys(quiz_ids)
++
++        grouped: dict[str, dict[str, Any]] = {}
++        per_co: dict[str, dict[int, COMarks]] = defaultdict(dict)
++        for r in rows:
++            aid = str(r["attempt_id"])
++            grouped.setdefault(aid, r)
++            co = int(r["co_number"])
++            per_co[aid][co] = COMarks(co=co, obtained=float(r["marks_obtained"]), maximum=float(r["max_marks"]))
++
++        out: list[AttemptScore] = []
++        for aid, r in grouped.items():
++            quiz_id = str(r["quiz_id"])
++            answers = r["answers"] or {}
++            questions: tuple = ()
++            keys = keys_by_quiz.get(quiz_id)
++            if keys:
++                try:
++                    questions = grade_attempt(keys, answers).questions
++                except ValueError:
++                    questions = ()
++            out.append(
++                AttemptScore(
++                    usn=r["usn"],
++                    quiz_id=quiz_id,
++                    module_id=str(r["module_id"]) if r["module_id"] else "unknown",
++                    attempt_number=int(r["attempt_number"]),
++                    per_co=per_co[aid],
++                    questions=questions,
++                )
++            )
++        return out
++
++    def _question_keys(self, quiz_ids: list[str]) -> dict[str, list[QuestionKey]]:
++        if not quiz_ids:
++            return {}
++        rows = self.conn.execute(
++            text(
++                "SELECT qq.quiz_id, q.id, c.number, q.correct_option, q.marks "
++                "FROM quiz_questions qq "
++                "JOIN questions q ON q.id = qq.question_id "
++                "JOIN course_outcomes c ON c.id = q.co_id "
++                "WHERE qq.quiz_id = ANY(CAST(:ids AS uuid[])) "
++                "ORDER BY qq.quiz_id, qq.position"
++            ),
++            {"ids": "{" + ",".join(quiz_ids) + "}"},
++        ).fetchall()
++        keys: dict[str, list[QuestionKey]] = defaultdict(list)
++        for quiz_id, qid, co, correct, marks in rows:
++            keys[str(quiz_id)].append(
++                QuestionKey(id=str(qid), co=int(co), correct_option=int(correct), marks=float(marks))
++            )
++        return dict(keys)
++
++    def get_student_progress(self, student_id: str, subject_id: str) -> dict[str, Any]:
++        rows = self.conn.execute(
++            text(
++                "SELECT a.quiz_id, a.attempt_number, a.total_score, a.max_score, a.submitted_at "
++                "FROM quiz_attempts a JOIN quizzes z ON z.id = a.quiz_id "
++                "WHERE a.student_id = :stid AND z.subject_id = :sid AND a.submitted_at IS NOT NULL "
++                "ORDER BY a.submitted_at"
++            ),
++            {"stid": as_uuid(student_id, "Student"), "sid": as_uuid(subject_id, "Subject")},
++        ).fetchall()
++        return {
++            "co_scores": [],
++            "attempts": [
++                {
++                    "quiz_id": str(r[0]),
++                    "attempt_number": int(r[1]),
++                    "total_score": to_float(r[2]),
++                    "max_score": to_float(r[3]),
++                    "submitted_at": r[4].isoformat() if r[4] else None,
++                }
++                for r in rows
++            ],
++        }
+diff -ruN -x __pycache__ -x node_modules -x '*.pyc' -x .pytest_cache a/backend/app/pg/calendar.py ./backend/app/pg/calendar.py
+--- a/backend/app/pg/calendar.py	1970-01-01 00:00:00.000000000 +0000
++++ ./backend/app/pg/calendar.py	2026-10-25 10:00:36.182986394 +0000
+@@ -0,0 +1,110 @@
++"""CalendarStore on Postgres (events table)."""
++
++from __future__ import annotations
++
++from datetime import datetime
++from typing import Any, Sequence
++
++from sqlalchemy import text
++
++from ..services.calendar import CalendarEvent
++from .common import as_uuid, to_str
++
++_COLS = (
++    "id, subject_id, section, type, title, starts_at, ends_at, quiz_id, module_id, "
++    "created_by, created_by_agent, created_at"
++)
++_UPDATABLE = {"section", "type", "title", "starts_at", "ends_at", "quiz_id", "module_id"}
++
++
++def _row_to_event(r: Any) -> CalendarEvent:
++    return CalendarEvent(
++        id=str(r["id"]),
++        subject_id=str(r["subject_id"]),
++        type=r["type"],
++        title=r["title"],
++        starts_at=r["starts_at"],
++        ends_at=r["ends_at"],
++        section=r["section"],
++        quiz_id=to_str(r["quiz_id"]),
++        module_id=to_str(r["module_id"]),
++        created_by=to_str(r["created_by"]),
++        created_by_agent=bool(r["created_by_agent"]),
++        created_at=r["created_at"],
++    )
++
++
++class PostgresCalendarStore:
++    def __init__(self, conn: Any) -> None:
++        self.conn = conn
++
++    def save_event(self, event: CalendarEvent) -> CalendarEvent:
++        row = self.conn.execute(
++            text(
++                "INSERT INTO events (subject_id, section, type, title, starts_at, ends_at, "
++                "quiz_id, module_id, created_by, created_by_agent) "
++                "VALUES (:sub, :sec, :type, :title, :start, :end, :quiz, :mod, :by, :agent) "
++                f"RETURNING {_COLS}"
++            ),
++            {
++                "sub": as_uuid(event.subject_id, "Subject"),
++                "sec": event.section,
++                "type": event.type,
++                "title": event.title,
++                "start": event.starts_at,
++                "end": event.ends_at,
++                "quiz": as_uuid(event.quiz_id, "Quiz") if event.quiz_id else None,
++                "mod": as_uuid(event.module_id, "Module") if event.module_id else None,
++                "by": event.created_by,
++                "agent": event.created_by_agent,
++            },
++        ).mappings().fetchone()
++        return _row_to_event(row)
++
++    def get_event(self, event_id: str) -> CalendarEvent | None:
++        row = self.conn.execute(
++            text(f"SELECT {_COLS} FROM events WHERE id = :id"), {"id": as_uuid(event_id, "Event")}
++        ).mappings().fetchone()
++        return _row_to_event(row) if row else None
++
++    def update_event(self, event_id: str, updates: dict[str, Any]) -> CalendarEvent | None:
++        fields = {k: v for k, v in updates.items() if k in _UPDATABLE}
++        if not fields:
++            return self.get_event(event_id)
++        sets = ", ".join(f"{k} = :{k}" for k in fields)
++        params = dict(fields)
++        params["id"] = as_uuid(event_id, "Event")
++        row = self.conn.execute(
++            text(f"UPDATE events SET {sets} WHERE id = :id RETURNING {_COLS}"), params
++        ).mappings().fetchone()
++        return _row_to_event(row) if row else None
++
++    def delete_event(self, event_id: str) -> bool:
++        result = self.conn.execute(
++            text("DELETE FROM events WHERE id = :id"), {"id": as_uuid(event_id, "Event")}
++        )
++        return result.rowcount > 0
++
++    def list_events(
++        self,
++        subject_ids: Sequence[str] | None = None,
++        from_time: datetime | None = None,
++        to_time: datetime | None = None,
++    ) -> list[CalendarEvent]:
++        where, params = [], {}
++        if subject_ids is not None:
++            if not subject_ids:
++                return []
++            where.append("subject_id = ANY(CAST(:subs AS uuid[]))")
++            params["subs"] = "{" + ",".join(as_uuid(s, "Subject") for s in subject_ids) + "}"
++        if from_time is not None:
++            where.append("starts_at >= :from_t")
++            params["from_t"] = from_time
++        if to_time is not None:
++            where.append("starts_at <= :to_t")
++            params["to_t"] = to_time
++        clause = (" WHERE " + " AND ".join(where)) if where else ""
++        rows = self.conn.execute(
++            text(f"SELECT {_COLS} FROM events{clause} ORDER BY starts_at"), params
++        ).mappings().fetchall()
++        return [_row_to_event(r) for r in rows]
+diff -ruN -x __pycache__ -x node_modules -x '*.pyc' -x .pytest_cache a/backend/app/pg/chunks.py ./backend/app/pg/chunks.py
+--- a/backend/app/pg/chunks.py	1970-01-01 00:00:00.000000000 +0000
++++ ./backend/app/pg/chunks.py	2026-10-25 10:00:36.182032010 +0000
+@@ -0,0 +1,229 @@
++"""ChunkStore on Postgres: the storage side of the slide-upload pipeline.
++
++Also holds the read queries that the coverage endpoint, slide retrieval and the study
++features share, so they all see the same chunks and CO links.
++"""
++
++from __future__ import annotations
++
++from typing import Any, Sequence
++
++from sqlalchemy import text
++
++from ..pipeline.ppt import SlideChunk
++from ..pipeline.upload import StoredChunk, TagResult
++from ..services.qa import InMemoryChunkRetrievalStore, RetrievalChunk
++from .common import as_uuid
++
++
++class PostgresChunkStore:
++    """Implements pipeline.upload.ChunkStore for one subject.
++
++    commit_status=True commits every status change, so a client polling
++    GET /modules/{id}/status sees `processing` while the work is still running.
++    """
++
++    def __init__(self, conn: Any, subject_id: str, *, commit_status: bool = False) -> None:
++        self.conn = conn
++        self.subject_id = as_uuid(subject_id, "Subject")
++        self.commit_status = commit_status
++        self._co_ids: dict[int, str] | None = None
++
++    # -- ChunkStore protocol --------------------------------------------
++
++    def set_module_status(self, module_id: str, status: str, error: str | None = None) -> None:
++        self.conn.execute(
++            text(
++                "UPDATE modules SET processing_status = :st, processing_error = :err, "
++                "processed_at = CASE WHEN :st IN ('done', 'failed') THEN now() ELSE NULL END "
++                "WHERE id = :id"
++            ),
++            {"st": status, "err": error, "id": as_uuid(module_id, "Module")},
++        )
++        if self.commit_status:
++            self.conn.commit()
++
++    def save_chunks(self, module_id: str, chunks: Sequence[SlideChunk]) -> list[StoredChunk]:
++        mid = as_uuid(module_id, "Module")
++        # A re-upload replaces the old slides (chunk_cos rows go with them).
++        self.conn.execute(text("DELETE FROM content_chunks WHERE module_id = :m"), {"m": mid})
++        saved: list[StoredChunk] = []
++        for c in chunks:
++            new_id = self.conn.execute(
++                text(
++                    "INSERT INTO content_chunks (module_id, slide_number, text, tag_status) "
++                    "VALUES (:m, :n, :t, 'untagged') RETURNING id"
++                ),
++                {"m": mid, "n": c.slide_number, "t": c.text},
++            ).scalar_one()
++            saved.append(StoredChunk(id=str(new_id), slide_number=c.slide_number, text=c.text))
++        return saved
++
++    def save_tags(self, tags: Sequence[TagResult]) -> None:
++        co_ids = self._co_id_map()
++        for t in tags:
++            linked = False
++            for number in t.cos:
++                co_id = co_ids.get(number)
++                if co_id is None:
++                    continue
++                self.conn.execute(
++                    text(
++                        "INSERT INTO chunk_cos (chunk_id, co_id, confidence) VALUES (:ch, :co, :cf) "
++                        "ON CONFLICT (chunk_id, co_id) DO UPDATE SET confidence = EXCLUDED.confidence"
++                    ),
++                    {"ch": as_uuid(t.chunk_id), "co": co_id, "cf": t.confidence},
++                )
++                linked = True
++            if linked:
++                self.conn.execute(
++                    text("UPDATE content_chunks SET tag_status = 'tagged' WHERE id = :id"),
++                    {"id": as_uuid(t.chunk_id)},
++                )
++
++    def mark_untagged(self, chunk_ids: Sequence[str]) -> None:
++        for cid in chunk_ids:
++            self.conn.execute(
++                text("UPDATE content_chunks SET tag_status = 'untagged' WHERE id = :id"),
++                {"id": as_uuid(cid)},
++            )
++
++    # -- helpers ---------------------------------------------------------
++
++    def _co_id_map(self) -> dict[int, str]:
++        if self._co_ids is None:
++            rows = self.conn.execute(
++                text("SELECT number, id FROM course_outcomes WHERE subject_id = :s"),
++                {"s": self.subject_id},
++            ).fetchall()
++            self._co_ids = {int(r[0]): str(r[1]) for r in rows}
++        return self._co_ids
++
++
++# ---------------------------------------------------------------------------
++# Read queries
++# ---------------------------------------------------------------------------
++
++def module_status(conn: Any, module_id: str) -> dict[str, Any] | None:
++    mid = as_uuid(module_id, "Module")
++    row = conn.execute(
++        text(
++            "SELECT m.processing_status, m.processing_error, "
++            "  (SELECT count(*) FROM content_chunks c WHERE c.module_id = m.id) AS total, "
++            "  (SELECT count(*) FROM content_chunks c WHERE c.module_id = m.id AND c.tag_status = 'tagged') AS tagged "
++            "FROM modules m WHERE m.id = :id"
++        ),
++        {"id": mid},
++    ).mappings().fetchone()
++    if row is None:
++        return None
++    return {
++        "processing_status": row["processing_status"],
++        "chunks_total": int(row["total"]),
++        "chunks_tagged": int(row["tagged"]),
++        "chunks_untagged": int(row["total"]) - int(row["tagged"]),
++        "error": row["processing_error"],
++    }
++
++
++def subject_cos(conn: Any, subject_id: str) -> list[dict[str, Any]]:
++    rows = conn.execute(
++        text(
++            "SELECT id, number, description, threshold_pct FROM course_outcomes "
++            "WHERE subject_id = :s ORDER BY number"
++        ),
++        {"s": as_uuid(subject_id, "Subject")},
++    ).mappings().fetchall()
++    return [
++        {
++            "id": str(r["id"]),
++            "number": int(r["number"]),
++            "description": r["description"],
++            "threshold_pct": float(r["threshold_pct"]),
++        }
++        for r in rows
++    ]
++
++
++def chunk_co_links(conn: Any, subject_id: str) -> list[tuple[str, int]]:
++    """(chunk_id, co_number) for every tagged chunk of a subject."""
++    rows = conn.execute(
++        text(
++            "SELECT cc.chunk_id, co.number FROM chunk_cos cc "
++            "JOIN course_outcomes co ON co.id = cc.co_id "
++            "JOIN content_chunks ch ON ch.id = cc.chunk_id "
++            "JOIN modules m ON m.id = ch.module_id "
++            "WHERE m.subject_id = :s"
++        ),
++        {"s": as_uuid(subject_id, "Subject")},
++    ).fetchall()
++    return [(str(r[0]), int(r[1])) for r in rows]
++
++
++def slide_chunks_for_subject(conn: Any, subject_id: str) -> list[dict[str, Any]]:
++    """One dict per (chunk, CO) link: what the study plan needs to link slides to a CO."""
++    rows = conn.execute(
++        text(
++            "SELECT ch.id, ch.module_id, ch.slide_number, ch.text, co.number "
++            "FROM chunk_cos cc "
++            "JOIN content_chunks ch ON ch.id = cc.chunk_id "
++            "JOIN modules m ON m.id = ch.module_id "
++            "JOIN course_outcomes co ON co.id = cc.co_id "
++            "WHERE m.subject_id = :s ORDER BY co.number, cc.confidence DESC NULLS LAST, m.number, ch.slide_number"
++        ),
++        {"s": as_uuid(subject_id, "Subject")},
++    ).fetchall()
++    return [
++        {
++            "chunk_id": str(r[0]),
++            "module_id": str(r[1]),
++            "slide_number": int(r[2]),
++            "text": r[3],
++            "co_number": int(r[4]),
++        }
++        for r in rows
++    ]
++
++
++def module_chunks_with_co(conn: Any, module_id: str) -> list[dict[str, Any]]:
++    """Chunks of one module, each with its best-matching CO id (None if untagged)."""
++    rows = conn.execute(
++        text(
++            "SELECT ch.id, ch.slide_number, ch.text, "
++            "  (SELECT cc.co_id FROM chunk_cos cc WHERE cc.chunk_id = ch.id "
++            "   ORDER BY cc.confidence DESC NULLS LAST LIMIT 1) AS co_id "
++            "FROM content_chunks ch WHERE ch.module_id = :m ORDER BY ch.slide_number"
++        ),
++        {"m": as_uuid(module_id, "Module")},
++    ).fetchall()
++    return [
++        {"chunk_id": str(r[0]), "slide_number": int(r[1]), "text": r[2], "co_id": str(r[3]) if r[3] else None}
++        for r in rows
++    ]
++
++
++class PostgresChunkRetrievalStore:
++    """Slide search for Q&A.
++
++    Decision (see docs/decisions.md #1): no embeddings. The corpus is a few hundred
++    short chunks per subject, so the subject's chunks are loaded and scored with the
++    keyword scorer in services/qa. No extension, no extra model, nothing to re-embed
++    when the server restarts.
++    """
++
++    def __init__(self, conn: Any) -> None:
++        self.conn = conn
++
++    def search_chunks(self, subject_id: str, query: str, top_k: int = 3) -> list[RetrievalChunk]:
++        rows = self.conn.execute(
++            text(
++                "SELECT ch.id, ch.module_id, ch.slide_number, ch.text "
++                "FROM content_chunks ch JOIN modules m ON m.id = ch.module_id "
++                "WHERE m.subject_id = :s"
++            ),
++            {"s": as_uuid(subject_id, "Subject")},
++        ).fetchall()
++        index = InMemoryChunkRetrievalStore()
++        for cid, mid, slide, body in rows:
++            index.add_chunk(subject_id, str(cid), str(mid), int(slide), body)
++        return index.search_chunks(subject_id, query, top_k=top_k)
+diff -ruN -x __pycache__ -x node_modules -x '*.pyc' -x .pytest_cache a/backend/app/pg/common.py ./backend/app/pg/common.py
+--- a/backend/app/pg/common.py	1970-01-01 00:00:00.000000000 +0000
++++ ./backend/app/pg/common.py	2026-10-27 17:34:16.663801109 +0000
+@@ -0,0 +1,85 @@
++"""Small helpers shared by the Postgres stores and the routers."""
++
++from __future__ import annotations
++
++import uuid
++from typing import Any
++
++from sqlalchemy import text
++
++from ..errors import AppError
++
++
++def as_uuid(value: Any, what: str = "Resource") -> str:
++    """Return the canonical UUID string, or raise 404 for anything that is not one.
++
++    A malformed id would otherwise reach Postgres and come back as a 500.
++    """
++    try:
++        return str(uuid.UUID(str(value)))
++    except (ValueError, AttributeError, TypeError):
++        raise AppError(404, "NOT_FOUND", f"{what} not found") from None
++
++
++def to_str(value: Any) -> str | None:
++    return None if value is None else str(value)
++
++
++def to_float(value: Any) -> float | None:
++    return None if value is None else float(value)
++
++
++def subject_for_faculty(conn: Any, subject_id: str, user: dict) -> dict:
++    """The subject row, if this faculty member owns it. Otherwise 404."""
++    sid = as_uuid(subject_id, "Subject")
++    row = conn.execute(
++        text("SELECT * FROM subjects WHERE id = :id AND faculty_user_id = :fid"),
++        {"id": sid, "fid": user["user_id"]},
++    ).mappings().fetchone()
++    if row is None:
++        raise AppError(404, "NOT_FOUND", "Subject not found")
++    return dict(row)
++
++
++def subject_for_student(conn: Any, subject_id: str, user: dict) -> dict:
++    """The subject row, if this student is enrolled in it. Otherwise 404."""
++    sid = as_uuid(subject_id, "Subject")
++    if not user.get("student_id"):
++        raise AppError(403, "FORBIDDEN", "Student access required")
++    row = conn.execute(
++        text(
++            "SELECT s.* FROM subjects s "
++            "JOIN enrollments e ON e.subject_id = s.id "
++            "WHERE s.id = :id AND e.student_id = :stid"
++        ),
++        {"id": sid, "stid": user["student_id"]},
++    ).mappings().fetchone()
++    if row is None:
++        raise AppError(404, "NOT_FOUND", "Subject not found")
++    return dict(row)
++
++
++def subject_for_user(conn: Any, subject_id: str, user: dict) -> dict:
++    """Faculty must own the subject, a student must be enrolled in it."""
++    if user["role"] == "faculty":
++        return subject_for_faculty(conn, subject_id, user)
++    return subject_for_student(conn, subject_id, user)
++
++
++def module_for_user(conn: Any, module_id: str, user: dict) -> dict:
++    """The module row, if the user may see its subject. Otherwise 404."""
++    mid = as_uuid(module_id, "Module")
++    row = conn.execute(
++        text("SELECT * FROM modules WHERE id = :id"), {"id": mid}
++    ).mappings().fetchone()
++    if row is None:
++        raise AppError(404, "NOT_FOUND", "Module not found")
++    subject_for_user(conn, str(row["subject_id"]), user)
++    return dict(row)
++
++
++def enrolled_subject_ids(conn: Any, student_id: str) -> list[str]:
++    rows = conn.execute(
++        text("SELECT subject_id FROM enrollments WHERE student_id = :s"), {"s": student_id}
++    ).fetchall()
++    return [str(r[0]) for r in rows]
+diff -ruN -x __pycache__ -x node_modules -x '*.pyc' -x .pytest_cache a/backend/app/pg/study.py ./backend/app/pg/study.py
+--- a/backend/app/pg/study.py	1970-01-01 00:00:00.000000000 +0000
++++ ./backend/app/pg/study.py	2026-10-25 10:00:56.230535638 +0000
+@@ -0,0 +1,154 @@
++"""Study plan, flashcard and note stores on Postgres."""
++
++from __future__ import annotations
++
++import json
++from typing import Any, Sequence
++
++from sqlalchemy import text
++
++from ..services.study_material import Flashcard, Note
++from ..services.study_plan import StudentStudyPlan
++from .common import as_uuid, to_str
++
++
++def _jsonb(value: Any) -> Any:
++    if isinstance(value, str):
++        return json.loads(value)
++    return value
++
++
++class PostgresStudyPlanStore:
++    def __init__(self, conn: Any) -> None:
++        self.conn = conn
++
++    def save_plan(self, plan: StudentStudyPlan) -> None:
++        weak = [as_uuid(w) for w in plan.weak_co_ids]
++        self.conn.execute(
++            text(
++                "INSERT INTO study_plans (id, student_id, subject_id, weak_co_ids, plan, generated_at) "
++                "VALUES (:id, :stid, :sid, CAST(:weak AS uuid[]), CAST(:plan AS jsonb), :at)"
++            ),
++            {
++                "id": as_uuid(plan.id),
++                "stid": as_uuid(plan.student_id, "Student"),
++                "sid": as_uuid(plan.subject_id, "Subject"),
++                "weak": "{" + ",".join(weak) + "}",
++                "plan": json.dumps(plan.plan),
++                "at": plan.generated_at,
++            },
++        )
++
++    def get_latest_plan(self, student_id: str, subject_id: str) -> StudentStudyPlan | None:
++        row = self.conn.execute(
++            text(
++                "SELECT id, student_id, subject_id, weak_co_ids, plan, generated_at "
++                "FROM study_plans WHERE student_id = :stid AND subject_id = :sid "
++                "ORDER BY generated_at DESC LIMIT 1"
++            ),
++            {"stid": as_uuid(student_id, "Student"), "sid": as_uuid(subject_id, "Subject")},
++        ).mappings().fetchone()
++        if row is None:
++            return None
++        return StudentStudyPlan(
++            id=str(row["id"]),
++            student_id=str(row["student_id"]),
++            subject_id=str(row["subject_id"]),
++            weak_co_ids=[str(w) for w in (row["weak_co_ids"] or [])],
++            plan=_jsonb(row["plan"]),
++            generated_at=row["generated_at"],
++        )
++
++
++class PostgresStudyMaterialStore:
++    def __init__(self, conn: Any) -> None:
++        self.conn = conn
++
++    def save_flashcards(self, cards: Sequence[Flashcard]) -> None:
++        for c in cards:
++            self.conn.execute(
++                text(
++                    "INSERT INTO flashcards (id, module_id, co_id, front, back) "
++                    "VALUES (:id, :m, :co, :f, :b)"
++                ),
++                {
++                    "id": as_uuid(c.id),
++                    "m": as_uuid(c.module_id, "Module"),
++                    "co": as_uuid(c.co_id) if c.co_id else None,
++                    "f": c.front,
++                    "b": c.back,
++                },
++            )
++
++    def save_notes(self, notes: Sequence[Note]) -> None:
++        for n in notes:
++            self.conn.execute(
++                text(
++                    "INSERT INTO notes (id, module_id, co_id, title, body) "
++                    "VALUES (:id, :m, :co, :t, :b)"
++                ),
++                {
++                    "id": as_uuid(n.id),
++                    "m": as_uuid(n.module_id, "Module"),
++                    "co": as_uuid(n.co_id) if n.co_id else None,
++                    "t": n.title,
++                    "b": n.body,
++                },
++            )
++
++    def list_flashcards(self, module_id: str) -> list[Flashcard]:
++        rows = self.conn.execute(
++            text(
++                "SELECT id, module_id, co_id, front, back, created_at FROM flashcards "
++                "WHERE module_id = :m ORDER BY created_at, id"
++            ),
++            {"m": as_uuid(module_id, "Module")},
++        ).mappings().fetchall()
++        return [
++            Flashcard(str(r["id"]), str(r["module_id"]), to_str(r["co_id"]), r["front"], r["back"], r["created_at"])
++            for r in rows
++        ]
++
++    def list_notes(self, module_id: str) -> list[Note]:
++        rows = self.conn.execute(
++            text(
++                "SELECT id, module_id, co_id, title, body, created_at FROM notes "
++                "WHERE module_id = :m ORDER BY created_at, id"
++            ),
++            {"m": as_uuid(module_id, "Module")},
++        ).mappings().fetchall()
++        return [
++            Note(str(r["id"]), str(r["module_id"]), to_str(r["co_id"]), r["title"], r["body"], r["created_at"])
++            for r in rows
++        ]
++
++    def has_material_for_module(self, module_id: str) -> bool:
++        mid = as_uuid(module_id, "Module")
++        return bool(
++            self.conn.execute(
++                text(
++                    "SELECT EXISTS (SELECT 1 FROM flashcards WHERE module_id = :m) "
++                    "OR EXISTS (SELECT 1 FROM notes WHERE module_id = :m)"
++                ),
++                {"m": mid},
++            ).scalar()
++        )
++
++    def delete_for_module(self, module_id: str) -> None:
++        mid = as_uuid(module_id, "Module")
++        self.conn.execute(text("DELETE FROM flashcards WHERE module_id = :m"), {"m": mid})
++        self.conn.execute(text("DELETE FROM notes WHERE module_id = :m"), {"m": mid})
++
++
++def subject_flashcards_with_co(conn: Any, subject_id: str) -> list[dict[str, Any]]:
++    """All flashcards of a subject, each with its CO number (for study-plan linking)."""
++    rows = conn.execute(
++        text(
++            "SELECT f.id, co.number, f.front, f.back FROM flashcards f "
++            "JOIN modules m ON m.id = f.module_id "
++            "JOIN course_outcomes co ON co.id = f.co_id "
++            "WHERE m.subject_id = :s ORDER BY co.number, f.created_at"
++        ),
++        {"s": as_uuid(subject_id, "Subject")},
++    ).fetchall()
++    return [{"id": str(r[0]), "co_number": int(r[1]), "front": r[2], "back": r[3]} for r in rows]
+diff -ruN -x __pycache__ -x node_modules -x '*.pyc' -x .pytest_cache a/backend/app/pg/usage.py ./backend/app/pg/usage.py
+--- a/backend/app/pg/usage.py	1970-01-01 00:00:00.000000000 +0000
++++ ./backend/app/pg/usage.py	2026-10-25 10:00:56.231719972 +0000
+@@ -0,0 +1,110 @@
++"""UsageStore on Postgres: every AI call and tool call goes to agent_logs."""
++
++from __future__ import annotations
++
++import json
++from datetime import datetime
++from typing import Any, Sequence
++
++from sqlalchemy import text
++
++from ..services.usage import UsageEntry
++
++
++class PostgresUsageStore:
++    def __init__(self, conn: Any) -> None:
++        self.conn = conn
++
++    def record(self, entry: UsageEntry) -> None:
++        self.conn.execute(
++            text(
++                "INSERT INTO agent_logs (user_id, role, kind, step, model, tool_name, "
++                "prompt_tokens, completion_tokens, total_tokens, latency_ms, args, result_summary, error) "
++                "VALUES (:uid, :role, :kind, :step, :model, :tool, :pt, :ct, :tt, :lat, "
++                "CAST(:args AS jsonb), :res, :err)"
++            ),
++            {
++                "uid": entry.user_id,
++                "role": entry.role,
++                "kind": entry.kind,
++                "step": entry.step,
++                "model": entry.model,
++                "tool": entry.tool_name,
++                "pt": entry.prompt_tokens,
++                "ct": entry.completion_tokens,
++                "tt": entry.total_tokens,
++                "lat": entry.latency_ms,
++                "args": json.dumps(entry.args) if entry.args is not None else None,
++                "res": entry.result_summary,
++                "err": entry.error,
++            },
++        )
++
++    def list_entries(
++        self, from_time: datetime | None = None, to_time: datetime | None = None
++    ) -> Sequence[UsageEntry]:
++        where, params = [], {}
++        if from_time is not None:
++            where.append("created_at >= :f")
++            params["f"] = from_time
++        if to_time is not None:
++            where.append("created_at <= :t")
++            params["t"] = to_time
++        clause = (" WHERE " + " AND ".join(where)) if where else ""
++        rows = self.conn.execute(
++            text(
++                "SELECT id, kind, step, user_id, role, model, tool_name, prompt_tokens, "
++                "completion_tokens, total_tokens, latency_ms, result_summary, error, created_at "
++                f"FROM agent_logs{clause}"
++            ),
++            params,
++        ).mappings().fetchall()
++        return [
++            UsageEntry(
++                id=str(r["id"]),
++                kind=r["kind"],
++                step=r["step"] or "other",
++                user_id=str(r["user_id"]) if r["user_id"] else None,
++                role=r["role"],
++                model=r["model"],
++                tool_name=r["tool_name"],
++                prompt_tokens=r["prompt_tokens"] or 0,
++                completion_tokens=r["completion_tokens"] or 0,
++                total_tokens=r["total_tokens"] or 0,
++                latency_ms=r["latency_ms"],
++                result_summary=r["result_summary"],
++                error=r["error"],
++                created_at=r["created_at"],
++            )
++            for r in rows
++        ]
++
++    def summary(self, from_time: datetime | None = None, to_time: datetime | None = None) -> list[dict[str, Any]]:
++        """Totals per step, computed in SQL so the cost page stays fast as the log grows."""
++        where, params = [], {}
++        if from_time is not None:
++            where.append("created_at >= :f")
++            params["f"] = from_time
++        if to_time is not None:
++            where.append("created_at <= :t")
++            params["t"] = to_time
++        clause = (" WHERE " + " AND ".join(where)) if where else ""
++        rows = self.conn.execute(
++            text(
++                "SELECT COALESCE(step, 'other') AS step, count(*) AS calls, "
++                "COALESCE(sum(prompt_tokens), 0) AS pt, COALESCE(sum(completion_tokens), 0) AS ct, "
++                "COALESCE(sum(total_tokens), 0) AS tt "
++                f"FROM agent_logs{clause} GROUP BY 1 ORDER BY tt DESC, step"
++            ),
++            params,
++        ).fetchall()
++        return [
++            {
++                "step": r[0],
++                "calls": int(r[1]),
++                "prompt_tokens": int(r[2]),
++                "completion_tokens": int(r[3]),
++                "total_tokens": int(r[4]),
++            }
++            for r in rows
++        ]
+diff -ruN -x __pycache__ -x node_modules -x '*.pyc' -x .pytest_cache a/backend/app/routers/calendar.py ./backend/app/routers/calendar.py
+--- a/backend/app/routers/calendar.py	2026-10-23 08:36:40.000000000 +0000
++++ ./backend/app/routers/calendar.py	2026-10-25 10:03:00.203896745 +0000
+@@ -125,5 +125,150 @@
+             return 403, format_error("FORBIDDEN", str(exc))
+ 
+ 
+-router = APIRouter() if HAS_FASTAPI else None
++# ---------------------------------------------------------------------------
++# Live routes (Postgres)
++# ---------------------------------------------------------------------------
+ 
++from pydantic import BaseModel
++from sqlalchemy import text
++
++from ..db import get_conn
++from ..deps import get_current_user, require_faculty
++from ..errors import AppError
++from ..pg.calendar import PostgresCalendarStore
++from ..pg.common import as_uuid, enrolled_subject_ids, subject_for_faculty, subject_for_user
++from ..services.calendar import (
++    CalendarPermissionError,
++    CalendarValidationError,
++    create_event,
++    delete_event,
++    update_event,
++)
++
++router = APIRouter(tags=["calendar"])
++
++
++class EventCreate(BaseModel):
++    subject_id: str
++    type: str
++    title: str
++    starts_at: datetime
++    ends_at: datetime | None = None
++    section: str | None = None
++    quiz_id: str | None = None
++    module_id: str | None = None
++
++
++class EventPatch(BaseModel):
++    type: str | None = None
++    title: str | None = None
++    starts_at: datetime | None = None
++    ends_at: datetime | None = None
++    section: str | None = None
++    quiz_id: str | None = None
++    module_id: str | None = None
++
++
++def _translate(exc: Exception) -> AppError:
++    if isinstance(exc, CalendarPermissionError):
++        return AppError(403, "FORBIDDEN", str(exc))
++    if isinstance(exc, CalendarValidationError):
++        return AppError(422, "VALIDATION_ERROR", str(exc))
++    return AppError(404, "NOT_FOUND", "Event not found")
++
++
++def _check_links(conn, subject_id: str, quiz_id: str | None, module_id: str | None) -> None:
++    """A linked quiz or module must belong to the same subject."""
++    if quiz_id and conn.execute(
++        text("SELECT 1 FROM quizzes WHERE id = :q AND subject_id = :s"),
++        {"q": as_uuid(quiz_id, "Quiz"), "s": subject_id},
++    ).fetchone() is None:
++        raise AppError(404, "NOT_FOUND", "Quiz not found")
++    if module_id and conn.execute(
++        text("SELECT 1 FROM modules WHERE id = :m AND subject_id = :s"),
++        {"m": as_uuid(module_id, "Module"), "s": subject_id},
++    ).fetchone() is None:
++        raise AppError(404, "NOT_FOUND", "Module not found")
++
++
++def _owned_event(conn, store: PostgresCalendarStore, event_id: str, user: dict):
++    event = store.get_event(event_id)
++    if event is None:
++        raise AppError(404, "NOT_FOUND", "Event not found")
++    subject_for_faculty(conn, event.subject_id, user)  # 404 if it is another faculty member's
++    return event
++
++
++@router.post("/events", status_code=201)
++def post_event(body: EventCreate, conn=Depends(get_conn), user=Depends(require_faculty)):
++    sid = str(subject_for_faculty(conn, body.subject_id, user)["id"])
++    _check_links(conn, sid, body.quiz_id, body.module_id)
++    try:
++        event = create_event(
++            PostgresCalendarStore(conn), user, sid, body.type, body.title.strip(), body.starts_at,
++            ends_at=body.ends_at, section=body.section, quiz_id=body.quiz_id, module_id=body.module_id,
++        )
++    except (CalendarPermissionError, CalendarValidationError) as exc:
++        raise _translate(exc) from None
++    return event.to_dict()
++
++
++@router.get("/events")
++def get_events(
++    subject_id: str | None = None,
++    from_: datetime | None = Query(None, alias="from"),
++    to: datetime | None = None,
++    conn=Depends(get_conn),
++    user=Depends(get_current_user),
++):
++    if user["role"] == "faculty":
++        if subject_id:
++            allowed = [str(subject_for_faculty(conn, subject_id, user)["id"])]
++        else:
++            rows = conn.execute(
++                text("SELECT id FROM subjects WHERE faculty_user_id = :f"), {"f": user["user_id"]}
++            ).fetchall()
++            allowed = [str(r[0]) for r in rows]
++        sections: dict[str, str] = {}
++    else:
++        if subject_id:
++            allowed = [str(subject_for_user(conn, subject_id, user)["id"])]
++        else:
++            allowed = enrolled_subject_ids(conn, user["student_id"])
++        rows = conn.execute(
++            text("SELECT subject_id, section FROM enrollments WHERE student_id = :s"), {"s": user["student_id"]}
++        ).fetchall()
++        sections = {str(r[0]): r[1] for r in rows}
++
++    events = PostgresCalendarStore(conn).list_events(allowed, from_, to)
++    if user["role"] == "student":
++        # Section-specific events are only for that section.
++        events = [e for e in events if e.section is None or e.section == sections.get(e.subject_id)]
++    return [e.to_dict() for e in events]
++
++
++@router.patch("/events/{event_id}")
++def patch_event(event_id: str, body: EventPatch, conn=Depends(get_conn), user=Depends(require_faculty)):
++    store = PostgresCalendarStore(conn)
++    _owned_event(conn, store, event_id, user)
++    updates = body.model_dump(exclude_unset=True)
++    if updates.get("title") is not None:
++        updates["title"] = updates["title"].strip()
++    existing = store.get_event(event_id)
++    if "quiz_id" in updates or "module_id" in updates:
++        _check_links(conn, existing.subject_id, updates.get("quiz_id"), updates.get("module_id"))
++    try:
++        return update_event(store, user, event_id, updates).to_dict()
++    except (CalendarPermissionError, CalendarValidationError, KeyError) as exc:
++        raise _translate(exc) from None
++
++
++@router.delete("/events/{event_id}")
++def remove_event(event_id: str, conn=Depends(get_conn), user=Depends(require_faculty)):
++    store = PostgresCalendarStore(conn)
++    _owned_event(conn, store, event_id, user)
++    try:
++        delete_event(store, user, event_id)
++    except CalendarPermissionError as exc:
++        raise _translate(exc) from None
++    return {"deleted": True}
+diff -ruN -x __pycache__ -x node_modules -x '*.pyc' -x .pytest_cache a/backend/app/routers/co_sheet.py ./backend/app/routers/co_sheet.py
+--- a/backend/app/routers/co_sheet.py	2026-10-23 08:36:40.000000000 +0000
++++ ./backend/app/routers/co_sheet.py	2026-10-25 10:02:35.366901169 +0000
+@@ -151,5 +151,139 @@
+             return 404, format_error("NOT_FOUND", str(exc))
+ 
+ 
+-router = APIRouter() if HAS_FASTAPI else None
++# ---------------------------------------------------------------------------
++# Live routes (Postgres)
++# ---------------------------------------------------------------------------
+ 
++from sqlalchemy import text
++
++from ..db import get_conn
++from ..deps import get_current_user, require_faculty
++from ..errors import AppError
++from ..pg.analytics import PostgresAnalyticsStore
++from ..pg.common import as_uuid, subject_for_faculty, subject_for_student
++
++router = APIRouter(tags=["co-sheet"])
++
++XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
++
++
++def _check_scope(conn, subject_id: str, scope: str, module_id: str | None) -> str | None:
++    if scope not in ("module", "semester"):
++        raise AppError(422, "VALIDATION_ERROR", "scope must be 'module' or 'semester'")
++    if scope == "module":
++        if not module_id:
++            raise AppError(400, "BAD_REQUEST", "module_id is required when scope=module")
++        row = conn.execute(
++            text("SELECT 1 FROM modules WHERE id = :m AND subject_id = :s"),
++            {"m": as_uuid(module_id, "Module"), "s": subject_id},
++        ).fetchone()
++        if row is None:
++            raise AppError(404, "NOT_FOUND", "Module not found")
++        return as_uuid(module_id)
++    return None
++
++
++@router.get("/subjects/{subject_id}/co-sheet")
++def co_sheet(
++    subject_id: str,
++    scope: str = "semester",
++    module_id: str | None = None,
++    section: str | None = None,
++    conn=Depends(get_conn),
++    user=Depends(require_faculty),
++):
++    sid = subject_for_faculty(conn, subject_id, user)["id"]
++    sid = str(sid)
++    mod = _check_scope(conn, sid, scope, module_id)
++    return get_co_sheet_data(PostgresAnalyticsStore(conn), sid, scope=scope, module_id=mod, section=section)
++
++
++@router.get("/subjects/{subject_id}/co-summary")
++def co_summary(subject_id: str, section: str | None = None, conn=Depends(get_conn), user=Depends(require_faculty)):
++    sid = str(subject_for_faculty(conn, subject_id, user)["id"])
++    return get_class_summary_data(PostgresAnalyticsStore(conn), sid, section=section)
++
++
++@router.get("/subjects/{subject_id}/weak-cos")
++def weak_cos_route(subject_id: str, section: str | None = None, conn=Depends(get_conn), user=Depends(require_faculty)):
++    sid = str(subject_for_faculty(conn, subject_id, user)["id"])
++    return get_weak_cos_data(PostgresAnalyticsStore(conn), sid, section=section)
++
++
++@router.get("/subjects/{subject_id}/cos/{co_id}/drilldown")
++def co_drilldown_route(
++    subject_id: str,
++    co_id: str,
++    module_id: str | None = None,
++    section: str | None = None,
++    conn=Depends(get_conn),
++    user=Depends(require_faculty),
++):
++    sid = str(subject_for_faculty(conn, subject_id, user)["id"])
++    cid = as_uuid(co_id, "Course outcome")
++    owned = conn.execute(
++        text("SELECT 1 FROM course_outcomes WHERE id = :c AND subject_id = :s"), {"c": cid, "s": sid}
++    ).fetchone()
++    if owned is None:
++        raise AppError(404, "NOT_FOUND", "Course outcome not found")
++    try:
++        return get_co_drilldown_data(
++            PostgresAnalyticsStore(conn), sid, cid,
++            module_id=as_uuid(module_id, "Module") if module_id else None, section=section,
++        )
++    except NotFoundError as exc:
++        raise AppError(404, "NOT_FOUND", str(exc)) from None
++
++
++@router.get("/subjects/{subject_id}/co-sheet/export")
++def co_sheet_export(
++    subject_id: str,
++    scope: str = "semester",
++    module_id: str | None = None,
++    section: str | None = None,
++    conn=Depends(get_conn),
++    user=Depends(require_faculty),
++):
++    subject = subject_for_faculty(conn, subject_id, user)
++    sid = str(subject["id"])
++    mod = _check_scope(conn, sid, scope, module_id)
++    data = export_co_sheet_excel(PostgresAnalyticsStore(conn), sid, scope=scope, module_id=mod, section=section)
++    safe_code = "".join(ch for ch in str(subject["code"]) if ch.isalnum() or ch in "-_") or "subject"
++    return Response(
++        content=data,
++        media_type=XLSX_MIME,
++        headers={"Content-Disposition": f'attachment; filename="co_sheet_{safe_code}.xlsx"'},
++    )
++
++
++def _progress(conn, user: dict, usn: str, subject_id: str) -> dict:
++    try:
++        return get_student_progress_data(
++            PostgresAnalyticsStore(conn), current_user=user, usn=usn, subject_id=subject_id
++        )
++    except ForbiddenError as exc:
++        raise AppError(403, "FORBIDDEN", str(exc)) from None
++    except NotFoundError as exc:
++        raise AppError(404, "NOT_FOUND", str(exc)) from None
++
++
++# NOTE: /students/me/progress must stay above /students/{usn}/progress.
++@router.get("/students/me/progress")
++def my_progress(subject_id: str, conn=Depends(get_conn), user=Depends(get_current_user)):
++    if user["role"] != "student":
++        raise AppError(403, "FORBIDDEN", "Student access required")
++    sid = str(subject_for_student(conn, subject_id, user)["id"])
++    return _progress(conn, user, user["usn"], sid)
++
++
++@router.get("/students/{usn}/progress")
++def student_progress(usn: str, subject_id: str, conn=Depends(get_conn), user=Depends(get_current_user)):
++    if user["role"] == "student":
++        # Own USN only, checked before anything is read.
++        if (user.get("usn") or "").strip().upper() != usn.strip().upper():
++            raise AppError(403, "FORBIDDEN", "Students can only view their own progress")
++        sid = str(subject_for_student(conn, subject_id, user)["id"])
++    else:
++        sid = str(subject_for_faculty(conn, subject_id, user)["id"])
++    return _progress(conn, user, usn, sid)
+diff -ruN -x __pycache__ -x node_modules -x '*.pyc' -x .pytest_cache a/backend/app/routers/study.py ./backend/app/routers/study.py
+--- a/backend/app/routers/study.py	2026-10-23 08:36:40.000000000 +0000
++++ ./backend/app/routers/study.py	2026-10-25 10:03:00.203315928 +0000
+@@ -176,5 +176,153 @@
+         return 200, notes
+ 
+ 
+-router = APIRouter() if HAS_FASTAPI else None
++# ---------------------------------------------------------------------------
++# Live routes (Postgres)
++# ---------------------------------------------------------------------------
+ 
++import logging
++
++from pydantic import BaseModel, Field
++
++from ..db import get_conn
++from ..deps import get_current_user, require_faculty, require_student
++from ..errors import AppError
++from ..pg.analytics import PostgresAnalyticsStore
++from ..pg.chunks import (
++    PostgresChunkRetrievalStore,
++    module_chunks_with_co,
++    slide_chunks_for_subject,
++    subject_cos,
++)
++from ..pg.common import module_for_user, subject_for_faculty, subject_for_student, subject_for_user
++from ..pg.study import PostgresStudyMaterialStore, PostgresStudyPlanStore, subject_flashcards_with_co
++from ..services.ai_glue import (
++    UsageRecorder,
++    get_client,
++    make_material_generator,
++    make_plan_generator,
++    make_qa_client,
++)
++from ..services.co_analytics import get_student_progress_data
++
++log = logging.getLogger(__name__)
++
++router = APIRouter(tags=["study"])
++
++
++class QARequest(BaseModel):
++    subject_id: str
++    question: str = Field(min_length=3, max_length=500)
++
++
++class StudyPlanRequest(BaseModel):
++    subject_id: str
++
++
++def _close(client) -> None:
++    if client is not None:
++        client.close()
++
++
++@router.post("/qa")
++def qa(body: QARequest, conn=Depends(get_conn), user=Depends(get_current_user)):
++    sid = str(subject_for_user(conn, body.subject_id, user)["id"])
++    client = get_client()
++    try:
++        result = answer_from_course_material(
++            PostgresChunkRetrievalStore(conn),
++            sid,
++            body.question.strip(),
++            ai_client=make_qa_client(client, UsageRecorder(conn, user)),
++        )
++    finally:
++        _close(client)
++    return result.to_dict()
++
++
++@router.get("/retrieve")
++def retrieve(subject_id: str, q: str, conn=Depends(get_conn), user=Depends(get_current_user)):
++    sid = str(subject_for_user(conn, subject_id, user)["id"])
++    if not q.strip():
++        raise AppError(422, "VALIDATION_ERROR", "q must not be empty")
++    chunks = retrieve_chunks(PostgresChunkRetrievalStore(conn), sid, q.strip())
++    return [c.to_dict() for c in chunks]
++
++
++@router.post("/students/me/study-plan", status_code=201)
++def create_my_study_plan(body: StudyPlanRequest, conn=Depends(get_conn), user=Depends(require_student)):
++    sid = str(subject_for_student(conn, body.subject_id, user)["id"])
++    progress = get_student_progress_data(
++        PostgresAnalyticsStore(conn), current_user=user, usn=user["usn"], subject_id=sid
++    )
++    scores = {row["co_number"]: row["percentage"] for row in progress["co_scores"]}
++    cos = {
++        c["number"]: {"id": c["id"], "threshold_pct": c["threshold_pct"], "description": c["description"]}
++        for c in subject_cos(conn, sid)
++    }
++    client = get_client()
++    try:
++        plan = build_study_plan(
++            PostgresStudyPlanStore(conn),
++            student_id=user["student_id"],
++            subject_id=sid,
++            student_co_percentages=scores,
++            co_configs=cos,
++            slide_chunks=slide_chunks_for_subject(conn, sid),
++            flashcards=subject_flashcards_with_co(conn, sid),
++            ai_generator=make_plan_generator(client, UsageRecorder(conn, user), cos),
++        )
++    finally:
++        _close(client)
++    return plan.to_dict()
++
++
++@router.get("/students/me/study-plan")
++def get_my_study_plan(subject_id: str, conn=Depends(get_conn), user=Depends(require_student)):
++    sid = str(subject_for_student(conn, subject_id, user)["id"])
++    plan = get_latest_study_plan(PostgresStudyPlanStore(conn), user["student_id"], sid)
++    if plan is None:
++        raise AppError(404, "NOT_FOUND", "No study plan yet for this subject")
++    return plan
++
++
++@router.post("/modules/{module_id}/study-material")
++def generate_study_material(
++    module_id: str, regenerate: bool = False, conn=Depends(get_conn), user=Depends(require_faculty)
++):
++    module = module_for_user(conn, module_id, user)
++    subject_for_faculty(conn, str(module["subject_id"]), user)
++    mid = str(module["id"])
++    chunks = module_chunks_with_co(conn, mid)
++    if not chunks:
++        raise AppError(409, "CONFLICT", "Upload and process the module's slides first.")
++
++    store = PostgresStudyMaterialStore(conn)
++    if regenerate:
++        store.delete_for_module(mid)
++
++    client = get_client()
++    try:
++        generator = make_material_generator(client, UsageRecorder(conn, user), chunks)
++        try:
++            cards, notes = generate_module_study_material(store, mid, module["title"], chunks, generator=generator)
++        except Exception:
++            if generator is None:
++                raise
++            log.warning("AI flashcard generation failed; using slide text", exc_info=True)
++            cards, notes = generate_module_study_material(store, mid, module["title"], chunks, generator=None)
++    finally:
++        _close(client)
++    return {"flashcards": [c.to_dict() for c in cards], "notes": [n.to_dict() for n in notes]}
++
++
++@router.get("/modules/{module_id}/flashcards")
++def list_flashcards(module_id: str, conn=Depends(get_conn), user=Depends(get_current_user)):
++    module = module_for_user(conn, module_id, user)
++    return get_module_flashcards(PostgresStudyMaterialStore(conn), str(module["id"]))
++
++
++@router.get("/modules/{module_id}/notes")
++def list_notes(module_id: str, conn=Depends(get_conn), user=Depends(get_current_user)):
++    module = module_for_user(conn, module_id, user)
++    return get_module_notes(PostgresStudyMaterialStore(conn), str(module["id"]))
+diff -ruN -x __pycache__ -x node_modules -x '*.pyc' -x .pytest_cache a/backend/app/routers/upload.py ./backend/app/routers/upload.py
+--- a/backend/app/routers/upload.py	2026-10-23 08:36:40.000000000 +0000
++++ ./backend/app/routers/upload.py	2026-10-25 10:02:20.929461651 +0000
+@@ -11,6 +11,8 @@
+ import io
+ from typing import Any, BinaryIO, Sequence
+ 
++from sqlalchemy import text
++
+ from app.pipeline.coverage import coverage
+ from app.pipeline.upload import COInfo, UploadReport, process_module_upload
+ from app.services.quizzes import ForbiddenError, NotFoundError
+@@ -114,5 +116,119 @@
+         ]
+ 
+ 
+-router = APIRouter() if HAS_FASTAPI else None
++# ---------------------------------------------------------------------------
++# Live routes (Postgres). The handler class above stays as the unit-tested logic.
++# ---------------------------------------------------------------------------
++
++import logging
++
++from fastapi import BackgroundTasks
++
++from ..db import get_conn, get_engine
++from ..deps import require_faculty
++from ..errors import AppError
++from ..pg.chunks import PostgresChunkStore, chunk_co_links, module_status, subject_cos
++from ..pg.common import module_for_user, subject_for_faculty
++from ..pg.usage import PostgresUsageStore  # noqa: F401  (kept for symmetry with other routers)
++from ..services.ai_glue import UsageRecorder, get_client, make_tagger
++
++log = logging.getLogger(__name__)
++
++router = APIRouter(tags=["upload"])
+ 
++MAX_UPLOAD_BYTES = 25 * 1024 * 1024
++
++
++def _co_infos(conn, subject_id: str) -> list[COInfo]:
++    return [COInfo(number=c["number"], description=c["description"] or "") for c in subject_cos(conn, subject_id)]
++
++
++def run_upload_pipeline(module_id: str, subject_id: str, data: bytes, user: dict) -> None:
++    """Parse, save and tag one deck on its own connection (runs after the response is sent).
++
++    A plain function with no request objects, so it can move to a Nebius Serverless Job.
++    """
++    engine = get_engine()
++    with engine.connect() as conn:
++        store = PostgresChunkStore(conn, subject_id, commit_status=True)
++        try:
++            recorder = UsageRecorder(conn, user)
++            client = get_client()
++            try:
++                process_module_upload(
++                    module_id=module_id,
++                    source=io.BytesIO(data),
++                    cos=_co_infos(conn, subject_id),
++                    tagger=make_tagger(client, recorder),
++                    store=store,
++                )
++            finally:
++                if client is not None:
++                    client.close()
++            conn.commit()
++        except Exception as exc:  # the pipeline already marked the module failed; record why
++            log.exception("upload pipeline crashed for module %s", module_id)
++            conn.rollback()
++            store.set_module_status(module_id, "failed", f"Upload failed: {exc}"[:500])
++
++
++@router.post("/modules/{module_id}/upload", status_code=202)
++async def upload_module(
++    module_id: str,
++    background: BackgroundTasks,
++    file: UploadFile = File(...),
++    conn=Depends(get_conn),
++    user=Depends(require_faculty),
++):
++    module = module_for_user(conn, module_id, user)
++    subject_for_faculty(conn, str(module["subject_id"]), user)
++
++    filename = (file.filename or "").strip()
++    if not filename.lower().endswith(".pptx"):
++        raise AppError(400, "BAD_REQUEST", "Only .pptx files are supported.")
++    data = await file.read(MAX_UPLOAD_BYTES + 1)
++    if len(data) > MAX_UPLOAD_BYTES:
++        raise AppError(400, "BAD_REQUEST", "File is larger than 25 MB.")
++    if not data.startswith(b"PK"):
++        raise AppError(400, "BAD_REQUEST", "That file is not a valid .pptx presentation.")
++    if module["processing_status"] == "processing":
++        raise AppError(409, "CONFLICT", "This module is already being processed.")
++
++    conn.execute(
++        text("UPDATE modules SET ppt_file_path = :f WHERE id = :id"),
++        {"f": filename[:200], "id": str(module["id"])},
++    )
++    PostgresChunkStore(conn, str(module["subject_id"]), commit_status=True).set_module_status(
++        str(module["id"]), "processing"
++    )
++    background.add_task(run_upload_pipeline, str(module["id"]), str(module["subject_id"]), data, user)
++    return {"module_id": str(module["id"]), "processing_status": "processing"}
++
++
++@router.get("/modules/{module_id}/status")
++def get_module_status(module_id: str, conn=Depends(get_conn), user=Depends(require_faculty)):
++    module = module_for_user(conn, module_id, user)
++    subject_for_faculty(conn, str(module["subject_id"]), user)
++    info = module_status(conn, str(module["id"]))
++    if info is None:
++        raise AppError(404, "NOT_FOUND", "Module not found")
++    return info
++
++
++@router.get("/subjects/{subject_id}/coverage")
++def get_subject_coverage(subject_id: str, conn=Depends(get_conn), user=Depends(require_faculty)):
++    subject = subject_for_faculty(conn, subject_id, user)
++    sid = str(subject["id"])
++    cos = subject_cos(conn, sid)
++    results = coverage([c["number"] for c in cos], chunk_co_links(conn, sid))
++    id_by_number = {c["number"]: c["id"] for c in cos}
++    return [
++        {
++            "co_id": id_by_number[r.co],
++            "co_number": r.co,
++            "chunk_count": r.chunk_count,
++            "warning": r.warning,
++            "message": r.message,
++        }
++        for r in results
++    ]
+diff -ruN -x __pycache__ -x node_modules -x '*.pyc' -x .pytest_cache a/backend/app/routers/usage.py ./backend/app/routers/usage.py
+--- a/backend/app/routers/usage.py	2026-10-23 08:36:40.000000000 +0000
++++ ./backend/app/routers/usage.py	2026-10-25 10:03:00.204321283 +0000
+@@ -39,5 +39,22 @@
+         return 200, summary
+ 
+ 
+-router = APIRouter() if HAS_FASTAPI else None
++# ---------------------------------------------------------------------------
++# Live route (Postgres)
++# ---------------------------------------------------------------------------
+ 
++from ..db import get_conn
++from ..deps import require_faculty
++from ..pg.usage import PostgresUsageStore
++
++router = APIRouter(tags=["usage"])
++
++
++@router.get("/usage/summary")
++def usage_summary(
++    from_: datetime | None = Query(None, alias="from"),
++    to: datetime | None = None,
++    conn=Depends(get_conn),
++    user=Depends(require_faculty),
++):
++    return PostgresUsageStore(conn).summary(from_, to)
+diff -ruN -x __pycache__ -x node_modules -x '*.pyc' -x .pytest_cache a/backend/app/services/ai_glue.py ./backend/app/services/ai_glue.py
+--- a/backend/app/services/ai_glue.py	1970-01-01 00:00:00.000000000 +0000
++++ ./backend/app/services/ai_glue.py	2026-10-25 10:01:34.689958343 +0000
+@@ -0,0 +1,293 @@
++"""Connects Arya's features to Danwin's Token Factory client.
++
++Every function here is optional glue: if Token Factory is not configured, or a call
++fails, the caller falls back to the grounded, code-only path (slide text, no LLM), so
++a missing key never breaks the demo and no answer is ever invented. Every provider
++call is written to agent_logs with its token counts, which feeds the cost page.
++
++Step names written to agent_logs: tagging, qa, flashcards, study_plan.
++"""
++
++from __future__ import annotations
++
++import json
++import logging
++import os
++import re
++import time
++from typing import Any, Callable, Sequence
++
++from ..pg.usage import PostgresUsageStore
++from .qa import NotInSlidesError
++from .usage import log_ai_call
++
++log = logging.getLogger(__name__)
++
++# step -> env vars to try, in order
++_MODEL_ENV = {
++    "tagging": ("MODEL_TAGGING", "MODEL_GENERATION", "MODEL_AGENT"),
++    "qa": ("MODEL_REASONING", "MODEL_AGENT", "MODEL_GENERATION"),
++    "flashcards": ("MODEL_GENERATION", "MODEL_AGENT"),
++    "study_plan": ("MODEL_GENERATION", "MODEL_AGENT"),
++}
++
++
++def model_for(step: str) -> str | None:
++    for name in _MODEL_ENV.get(step, ("MODEL_GENERATION",)):
++        value = (os.getenv(name) or "").strip()
++        if value:
++            return value
++    return None
++
++
++def get_client() -> Any | None:
++    """A TokenFactoryClient, or None when the key or base URL is not set."""
++    key = (os.getenv("TOKEN_FACTORY_API_KEY") or "").strip()
++    base = (os.getenv("TOKEN_FACTORY_BASE_URL") or "").strip()
++    if not key or not base:
++        return None
++    from ai.token_factory import TokenFactoryClient  # imported late: optional dependency
++
++    return TokenFactoryClient(api_key=key, base_url=base)
++
++
++class UsageRecorder:
++    """Writes provider calls to agent_logs through the shared connection."""
++
++    def __init__(self, conn: Any, user: dict | None) -> None:
++        self.store = PostgresUsageStore(conn)
++        self.user_id = (user or {}).get("user_id")
++        self.role = (user or {}).get("role")
++
++    def ai_call(
++        self,
++        step: str,
++        model: str,
++        usage: dict[str, Any] | None,
++        *,
++        latency_ms: int | None = None,
++        error: str | None = None,
++        summary: str | None = None,
++    ) -> None:
++        usage = usage or {}
++        try:
++            log_ai_call(
++                self.store,
++                step,
++                model,
++                int(usage.get("prompt_tokens") or 0),
++                int(usage.get("completion_tokens") or 0),
++                user_id=self.user_id,
++                role=self.role,
++                latency_ms=latency_ms,
++                result_summary=summary,
++                error=error,
++            )
++        except Exception:  # logging must never break the feature
++            log.exception("could not write agent_logs row")
++
++    def tagging_hook(self) -> Callable[[dict[str, Any]], None]:
++        """usage_recorder for ai.tagging.tag_content_with_COs (one call per provider attempt)."""
++
++        def record(item: dict[str, Any]) -> None:
++            self.ai_call(
++                "tagging",
++                item.get("model") or model_for("tagging") or "unknown",
++                item,
++                error=item.get("error"),
++                summary=f"batch {item.get('batch_number')} attempt {item.get('attempt')}",
++            )
++
++        return record
++
++
++def _parse_json(content: str | None) -> Any:
++    text_ = (content or "").strip()
++    if text_.startswith("```"):
++        lines = text_.splitlines()
++        if len(lines) >= 3:
++            text_ = "\n".join(lines[1:-1]).strip()
++    match = re.search(r"[\[{].*[\]}]", text_, flags=re.DOTALL)
++    if not match:
++        raise ValueError("model did not return JSON")
++    return json.loads(match.group(0))
++
++
++def _chat(client: Any, recorder: UsageRecorder, step: str, system: str, user: str, *, max_tokens: int, temperature: float) -> str:
++    model = model_for(step)
++    if not model:
++        raise RuntimeError(f"No model configured for step {step!r}")
++    started = time.monotonic()
++    try:
++        result = client.chat(
++            model=model,
++            messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
++            temperature=temperature,
++            max_tokens=max_tokens,
++        )
++    except Exception as exc:
++        recorder.ai_call(step, model, None, latency_ms=int((time.monotonic() - started) * 1000), error=str(exc)[:300])
++        raise
++    recorder.ai_call(step, model, result.usage, latency_ms=int((time.monotonic() - started) * 1000))
++    if not result.content:
++        raise ValueError("empty model response")
++    return result.content
++
++
++# ---------------------------------------------------------------------------
++# Tagging (upload pipeline)
++# ---------------------------------------------------------------------------
++
++def make_tagger(client: Any | None, recorder: UsageRecorder):
++    """Tagger for process_module_upload. Without a client, nothing is tagged (never fails)."""
++    model = model_for("tagging")
++    if client is None or not model:
++        log.warning("Token Factory not configured: chunks will be saved untagged")
++        return lambda chunks, cos: []
++
++    from ai.tagging import tag_content_with_COs
++
++    def tagger(chunks: Sequence[Any], cos: Sequence[Any]):
++        return tag_content_with_COs(chunks, cos, client, model=model, usage_recorder=recorder.tagging_hook())
++
++    return tagger
++
++
++# ---------------------------------------------------------------------------
++# Slide-grounded Q&A
++# ---------------------------------------------------------------------------
++
++QA_SYSTEM = (
++    "You answer a student's question using ONLY the slide excerpts provided. "
++    "Cite slides as [Slide N]. If the excerpts do not contain the answer, reply exactly: "
++    "NOT_IN_SLIDES. Do not use outside knowledge. Keep the answer under 150 words."
++)
++
++
++def make_qa_client(client: Any | None, recorder: UsageRecorder):
++    """ai_client for answer_from_course_material: (question, context) -> answer text."""
++    if client is None or not model_for("qa"):
++        return None
++
++    def ask(question: str, context: str) -> str:
++        reply = _chat(
++            client, recorder, "qa", QA_SYSTEM,
++            f"Slide excerpts:\n{context}\n\nQuestion: {question}",
++            max_tokens=400, temperature=0.1,
++        ).strip()
++        if "NOT_IN_SLIDES" in reply:
++            raise NotInSlidesError()  # the Q&A service turns this into a refusal
++        return reply
++
++    return ask
++
++
++# ---------------------------------------------------------------------------
++# Flashcards and notes (once per module)
++# ---------------------------------------------------------------------------
++
++MATERIAL_SYSTEM = (
++    "You write study material from lecture slides. Use ONLY the slide text given. "
++    "Return JSON only: {\"flashcards\": [{\"slide_number\": int, \"front\": str, \"back\": str}], "
++    "\"notes\": [{\"slide_number\": int, \"title\": str, \"body\": str}]}. "
++    "Write 1 flashcard and at most 1 note per content-bearing slide. Keep each back/body under 60 words."
++)
++
++
++def make_material_generator(client: Any | None, recorder: UsageRecorder, chunks_for_co: Sequence[dict[str, Any]]):
++    """generator for generate_module_study_material, or None to use the grounded fallback."""
++    if client is None or not model_for("flashcards"):
++        return None
++    co_by_slide = {c["slide_number"]: c.get("co_id") for c in chunks_for_co}
++
++    def generator(module_title: str, chunks: Sequence[dict[str, Any]]):
++        blocks = "\n\n".join(
++            f"[Slide {c['slide_number']}]\n{(c.get('text') or '')[:600]}" for c in list(chunks)[:40]
++        )
++        raw = _chat(
++            client, recorder, "flashcards", MATERIAL_SYSTEM,
++            f"Module: {module_title}\n\n{blocks}", max_tokens=3000, temperature=0.3,
++        )
++        data = _parse_json(raw)
++        cards = [
++            {"co_id": co_by_slide.get(c.get("slide_number")), "front": str(c["front"]).strip(), "back": str(c["back"]).strip()}
++            for c in data.get("flashcards", [])
++            if isinstance(c, dict) and c.get("front") and c.get("back") and c.get("slide_number") in co_by_slide
++        ]
++        notes = [
++            {"co_id": co_by_slide.get(n.get("slide_number")), "title": str(n["title"]).strip(), "body": str(n["body"]).strip()}
++            for n in data.get("notes", [])
++            if isinstance(n, dict) and n.get("title") and n.get("body") and n.get("slide_number") in co_by_slide
++        ]
++        if not cards:
++            raise ValueError("model returned no usable flashcards")
++        return cards, notes
++
++    return generator
++
++
++# ---------------------------------------------------------------------------
++# Study plan
++# ---------------------------------------------------------------------------
++
++PLAN_SYSTEM = (
++    "You are a study coach. For each weak Course Outcome, write a short, specific study "
++    "recommendation (max 40 words) that refers only to the slide summaries given. "
++    "Return JSON only: {\"CO3\": \"recommendation\", ...}."
++)
++
++
++def make_plan_generator(
++    client: Any | None,
++    recorder: UsageRecorder,
++    co_configs: dict[int, dict[str, Any]],
++):
++    """ai_generator for build_study_plan, or None to use the grounded builder.
++
++    Slides and flashcards are always linked in code from the database; the model only
++    writes the recommendation text, so it can never invent a slide.
++    """
++    if client is None or not model_for("study_plan"):
++        return None
++
++    def generator(weak_cos: list[int], slides: list[dict[str, Any]], cards: list[dict[str, Any]]):
++        steps: list[dict[str, Any]] = []
++        digest: dict[str, str] = {}
++        for co in weak_cos:
++            cfg = co_configs.get(co, {})
++            rel_slides = [
++                {"module_id": s.get("module_id"), "slide_number": s.get("slide_number"), "summary": (s.get("text") or "")[:120]}
++                for s in slides if s.get("co_number") == co
++            ][:5]
++            rel_cards = [
++                {"id": c.get("id"), "front": c.get("front"), "back": c.get("back")}
++                for c in cards if c.get("co_number") == co
++            ][:5]
++            steps.append({
++                "co_number": co,
++                "goal": f"Master CO{co}: {cfg.get('description', '')}".strip(),
++                "recommendation": (
++                    f"Review the {len(rel_slides)} linked slides, then practise with the "
++                    f"{len(rel_cards)} flashcards to reach the {cfg.get('threshold_pct', 60)}% threshold."
++                ),
++                "slides": rel_slides,
++                "flashcards": rel_cards,
++            })
++            digest[f"CO{co}"] = f"{cfg.get('description', '')} | slides: " + "; ".join(
++                f"slide {s['slide_number']}: {s['summary']}" for s in rel_slides
++            )
++        try:
++            raw = _chat(
++                client, recorder, "study_plan", PLAN_SYSTEM,
++                json.dumps(digest), max_tokens=900, temperature=0.3,
++            )
++            advice = _parse_json(raw)
++            for step in steps:
++                text_ = advice.get(f"CO{step['co_number']}")
++                if isinstance(text_, str) and text_.strip():
++                    step["recommendation"] = text_.strip()
++        except Exception:  # keep the code-built recommendations
++            log.warning("study plan AI call failed; using grounded recommendations", exc_info=True)
++        return steps
++
++    return generator
+diff -ruN -x __pycache__ -x node_modules -x '*.pyc' -x .pytest_cache a/backend/app/services/qa.py ./backend/app/services/qa.py
+--- a/backend/app/services/qa.py	2026-10-23 08:36:40.000000000 +0000
++++ ./backend/app/services/qa.py	2026-10-25 10:04:42.701005836 +0000
+@@ -52,9 +52,22 @@
+     ) -> list[RetrievalChunk]: ...
+ 
+ 
++_STOPWORDS = frozenset(
++    "a an and are as at be but by can do does for from how i if in into is it its me my "
++    "of on or so than that the their them then there these they this to us was we were "
++    "what when where which who why will with you your explain define describe tell about "
++    "give please difference between meaning".split()
++)
++
++
+ def _tokenize(text: str) -> list[str]:
+-    """Tokenize and normalize words, dropping punctuation."""
+-    return re.findall(r"\b[a-zA-Z0-9_-]{2,}\b", text.lower())
++    """Tokenize and normalize words, dropping punctuation and question filler words."""
++    words = re.findall(r"\b[a-zA-Z0-9_-]{2,}\b", text.lower())
++    return [w for w in words if w not in _STOPWORDS]
++
++
++class NotInSlidesError(Exception):
++    """The AI client says the retrieved slides do not answer the question."""
+ 
+ 
+ class InMemoryChunkRetrievalStore:
+@@ -183,8 +196,12 @@
+     if ai_client is not None:
+         try:
+             answer_text = ai_client(question, context_str)
+-        except Exception:
+-            # Fall back cleanly if AI call fails
++        except Exception as exc:
++            # The name check also matches when this module was imported under two
++            # package names (as the test suite does), where isinstance would miss.
++            if isinstance(exc, NotInSlidesError) or type(exc).__name__ == "NotInSlidesError":
++                return QAResult(answer=REFUSAL_MESSAGE, citations=[], refused=True)
++            # Fall back cleanly if the AI call fails
+             answer_text = f"Based on the slides:\n{context_blocks[0]}"
+     else:
+         # Grounded fallback: return summary citing the highest-scoring slide
+diff -ruN -x __pycache__ -x node_modules -x '*.pyc' -x .pytest_cache a/docs/arya-integration-notes.md ./docs/arya-integration-notes.md
+--- a/docs/arya-integration-notes.md	1970-01-01 00:00:00.000000000 +0000
++++ ./docs/arya-integration-notes.md	2026-10-28 02:37:43.215905713 +0000
+@@ -0,0 +1,63 @@
++# Arya's integration notes (28 Oct 2026)
++
++Status and decisions for the routes Arya wired to Postgres. Written for Aparna and Danwin.
++Nothing below has been run on the hosted Supabase database or Render.
++
++## 1. Ownership conflict to settle (frontend and tasks 8 to 13)
++
++The three team files and Aparna's message do not agree. No file was changed to resolve this.
++
++| Source | What it says about screens and integration |
++|---|---|
++| `docs/team/arya.md` | Arya owns backend logic only. No screens, no frontend. |
++| `docs/team/aparna.md` | Tasks 8 to 13 are Aparna's: setup/upload/coverage, roster, quiz builder, attempt, progress and CO sheet screens. |
++| `docs/team/danwin.md` | Tasks 8 to 13 are Danwin's, a different list: app shell and login, chat, study/Q&A/flashcards, review, calendar and cost page. It also gives him connecting the upload and quiz screens to the pipeline. |
++| Aparna's message to Arya | Asks Arya to take "the screens and integration (tasks 8 to 13)". |
++
++The same task numbers mean different work in `aparna.md` and `danwin.md`. Nobody owns the frontend API client
++(`frontend/src/lib` has no `fetch` and no `VITE_API_URL`). Decision needed: one owner for the API client,
++and one list of screens per person.
++
++## 2. What was added (all in new files or appended routes)
++
++- `backend/app/pg/`: Postgres stores for analytics, chunks and retrieval, calendar, study plan, flashcards and notes, usage, plus access helpers (`subject_for_faculty`, `subject_for_student`, `module_for_user`, `as_uuid`).
++- `backend/app/services/ai_glue.py`: Token Factory glue. Without a key every feature falls back to code only; every provider call is written to `agent_logs` with token counts.
++- Live routes in `upload.py`, `co_sheet.py`, `study.py`, `calendar.py`, `usage.py`. The handler classes and their unit tests are kept.
++- `main.py`: five lines, after `attempts.router`.
++- `seed/seed.py`, and `tests/backend/test_arya_integration.py` (29 tests).
++
++Not touched: `stores/`, `attempts.py`, `quizzes_admin.py`, migrations, `docs/team/aparna.md`, `docs/team/danwin.md`, `docs/api-contract.md`, `frontend/`, `ai/`.
++`routers/quizzes.py` is still an empty scaffold registered after `quizzes_admin.router`; it can be deleted from the router list.
++
++## 3. Behaviour worth knowing
++
++- **Access:** faculty only reach subjects they own (anything else is 404, not 403, so ids are not leaked); students only reach subjects they are enrolled in and only their own USN. Calendar events for one section are hidden from the other section.
++- **Upload runs as a background task.** `POST /modules/{id}/upload` returns 202 `processing` at once; the job commits status changes so `GET /modules/{id}/status` shows `processing`, then `done` or `failed` with a reason. A second upload while processing returns 409. Re-uploading replaces the module's chunks. Single worker only (the task runs in the web process). The uploaded file is parsed in memory and not kept; only its name is stored.
++- **CO sheet vs `counted`:** the sheet re-applies `ATTEMPT_RULE` in code over the per-attempt `student_co_scores` rows, the same setting Aparna's submit uses to set `counted`. Tests check there is exactly one counted row per student and CO and that it equals the sheet. If the rule is ever changed in config, old `counted` flags are not rewritten, but the sheet follows the config.
++- **Slide Q&A** uses keyword retrieval over Postgres chunks (see `decisions.md` #1). With no AI key it answers by quoting the best slide; with a key the model may only answer from the retrieved slides, and "not in the slides" becomes a refusal.
++- **Study plan:** slides and flashcards are linked in code from the database; the model only writes the recommendation text. A CO the student has no score for counts as weak (`services/study_plan.py` says so). Example: the seeded student 1XX23CS060 gets a plan for CO3 to CO6. Product question below.
++- **Seed content is small:** 13 slides, 10 approved questions, 4 modules, 2 quizzes. Enough for the sheet and weak-CO story; thin for a Q&A demo. Upload a real deck for the video.
++
++## 4. Differences from `docs/api-contract.md` (Aparna keeps that file)
++
++- `GET /subjects/{id}/co-sheet`: `columns` holds labels (`"CO1"`, `"CO2"`), not numbers. Rows also carry `section`, `total_obtained`, `total_max`, `total_pct`, and the response has an extra `averages`. Rows' `co_scores` is keyed by label and is `null` for a CO the student has not been assessed on.
++- `GET /subjects/{id}/coverage`: extra `message` field.
++- `GET /students/.../progress`: extra `name`, `section`, `subject_id`, and per-CO `marks_obtained`, `max_marks`, `attained` (false when unassessed, with null marks and percentage).
++- `GET /subjects/{id}/co-summary`: extra `threshold_pct`, `enrolled`, `attempted`, `target_met`, `gap`.
++- Inner shapes marked TBC: the drill-down returns the students and questions behind the CO; the study plan is `{id, student_id, subject_id, weak_co_ids, plan: {title, weak_cos, steps: [{co_number, goal, recommendation, slides, flashcards}]}, generated_at}`.
++- `POST /events` and the other event routes return the event with `id, subject_id, type, title, starts_at, ends_at, section, quiz_id, module_id`.
++- Errors use `AppError` and the contract's error shape.
++
++## 5. How it was tested, and what was not
++
++See `TEST_RESULTS.md` in the package. In short: 165 unit tests, Aparna's 96 backend tests and 29 new integration tests pass on a local Postgres 16
++(migrations 001 to 003, no Supabase roles, no Token Factory key). Not verified: the hosted database, migration 004 grants, Render, any real
++Token Factory call, the frontend, concurrent use. Do not describe database integration as verified until the same tests pass against the hosted database.
++
++## 6. Open questions
++
++1. Frontend and tasks 8 to 13 ownership (section 1).
++2. Danwin: is keyword retrieval acceptable, or is there an embedding model ID? (`decisions.md` #1)
++3. Faculty: should a student's study plan include COs they have not been assessed on yet?
++4. Faculty: Excel format. The export is a simple USN, name, section, CO%, total sheet plus a class summary sheet.
++5. Whether to run the seed on the shared Supabase database, and when. It adds a subject, 60 students and one faculty login; `--remove` deletes exactly those rows.
+diff -ruN -x __pycache__ -x node_modules -x '*.pyc' -x .pytest_cache a/docs/decisions.md ./docs/decisions.md
+--- a/docs/decisions.md	2026-10-23 08:36:40.000000000 +0000
++++ ./docs/decisions.md	2026-10-28 02:37:43.214314471 +0000
+@@ -27,6 +27,10 @@
+ 
+ If pgvector is chosen, Aparna adds the `vector` extension and the `embedding` column to the schema (see `requests-to-aparna.md`). Embedding dimension depends on the model, so the schema waits for the model ID.
+ 
++**Update (Arya, 28 Oct): built and tested as Fallback B, still waiting for Danwin to confirm.** Nobody has confirmed an embedding model on Token Factory, so slide Q&A currently loads a subject's chunks from Postgres and scores them with the keyword scorer in `services/qa.py` (common question words are ignored). It needs no extension, no extra model and no schema change, and nothing is lost when the server restarts. Retrieval is behind `PostgresChunkRetrievalStore.search_chunks`, so switching to pgvector or full-text search later changes one class. Limits: it matches words, not meaning, so a question phrased with none of the slide's words will be refused. The integration tests check that on-topic questions cite the right slide and off-topic ones are refused.
++
++- [ ] Danwin: confirm Fallback B is acceptable for the demo, or give the embedding model ID.
++
+ ## 2. Which attempt counts when a student attempts twice
+ 
+ **Status: Open, faculty decide. Default: `best`**
+diff -ruN -x __pycache__ -x node_modules -x '*.pyc' -x .pytest_cache a/docs/message-to-aparna-from-arya.md ./docs/message-to-aparna-from-arya.md
+--- a/docs/message-to-aparna-from-arya.md	1970-01-01 00:00:00.000000000 +0000
++++ ./docs/message-to-aparna-from-arya.md	2026-10-28 02:37:43.221747433 +0000
+@@ -0,0 +1,50 @@
++# Message to Aparna
++
++**Subject: My routers are wired to Postgres and tested locally. Please review, and I need four answers.**
++
++Hi Aparna,
++
++I pulled `main` and read your message. My part is on a branch, ready for you to review. All numbers below are from a local Postgres 16 with migrations 001 to 003. **I have not run any of it on the shared Supabase database or on Render, so please don't treat integration as verified until we do.**
++
++## What is on my branch
++
++- The five unwired routers now have real routes: `upload.py`, `co_sheet.py`, `study.py`, `calendar.py`, `usage.py`. Postgres stores are in a new package, `backend/app/pg/`.
++- `main.py`: five lines, added after `attempts.router`, as you suggested. I am the only one touching those lines.
++- `seed/seed.py`, a runner that works against a real database (details below).
++- `tests/backend/test_arya_integration.py`: 29 tests. Results: 165 unit tests pass, your 96 backend tests still pass, and the 29 new ones pass.
++- I did **not** touch `quizzes_admin.py`, `attempts.py`, `stores/`, migrations, `docs/api-contract.md` or the team files. I only used your tables and your `counted` column.
++- `docs/arya-integration-notes.md` has the details. `TEST_RESULTS.md` lists what was and was not tested.
++
++## Your five requests
++
++1. **Integration plan:** done locally as above. Provisional targets (subject to the real submission deadline): your review by Oct 29, then we run the same tests against the hosted database together.
++2. **`main.py`:** one line per router after `attempts.router`, already done.
++3. **Seed:** `python -m seed.seed --yes` loads one faculty login, 60 students, a subject with 6 COs, 4 modules, 13 slides, 10 approved questions, 2 published quizzes, 118 attempts, events, flashcards and notes. Invented names and USNs only. The old SQL failed on a real database: it published quizzes before their questions existed, and its password hashes were placeholders so no login worked. Both are fixed. Running it twice adds nothing, and `--remove` deletes only the rows the seed created. Demo logins are in the README.
++4. **Team docs:** I updated `arya.md` with a status table. I did **not** move tasks 8 to 13 into my file, because the files disagree (next section).
++5. **Missing or wrong endpoints:** nothing missing from your side. Small differences from the contract are listed in section 4 of the notes. For example, `co-sheet` returns `columns` as `["CO1", ...]`, not numbers, and has a few extra fields.
++
++## Four questions
++
++1. **Frontend ownership.** `arya.md` gives me no screens. `aparna.md` lists tasks 8 to 13 under you. `danwin.md` uses the same numbers for a different list (login, chat, study screens, calendar, cost page) and gives Danwin the upload and quiz screen integration. Your message asks me to take them. Nobody owns the frontend API client. Can we agree one owner for the API client and one list of screens per person? I would like Danwin's view before I commit to anything.
++2. **Hosted database.** Can you (or I, with the connection details sent privately) run `pytest tests/backend` on the shared Supabase database, and decide when to run the seed there? I will not seed it until you agree. The seed adds one subject, 60 students and one faculty login.
++3. **Migration 004.** Your grants for `anon` and `authenticated` need Supabase roles, so I could not test them locally. Please confirm my routes still work after 004 on Supabase.
++4. **Delete `quizzes.router`?** It is an empty scaffold registered after `quizzes_admin.router`. I would drop it from the list, but it is your call.
++
++## Things to confirm that affect your code
++
++- The CO sheet re-applies `ATTEMPT_RULE` in code over the per-attempt rows, the same setting your submit uses for `counted`. Tests check there is exactly one counted row per student and CO and that it equals the sheet. Does anything else you built treat `counted` as the source of truth?
++- A student asking for another student's progress gets 403, as in the contract. Faculty only see subjects they own, and I return 404 for a subject that is not theirs.
++- Study plans treat a CO the student has not been assessed on as weak. That is how the service was written; I flagged it in the notes as a question for faculty.
++
++## Token Factory
++
++Not confirmed, so I used the fallback paths. With no key, tagging leaves chunks untagged (the upload still succeeds), answers quote the best slide, and flashcards and plans use slide text. AI-backed paths were tested only with a fake client. When the key and model IDs are confirmed, we should test them separately; nothing about them is in the repo.
++
++## Still to do
++
++- Run the tests on the hosted database, and fix whatever they find.
++- The frontend API client and screens, once ownership is agreed.
++- Submission work: description, requirement-mapping table, feedback notes. I propose we agree who records and edits the video once the demo runs.
++
++Thanks,
++Arya
+diff -ruN -x __pycache__ -x node_modules -x '*.pyc' -x .pytest_cache a/docs/submission-draft.md ./docs/submission-draft.md
+--- a/docs/submission-draft.md	1970-01-01 00:00:00.000000000 +0000
++++ ./docs/submission-draft.md	2026-10-28 02:50:41.279793271 +0000
+@@ -0,0 +1,81 @@
++# Submission draft (Arya), 28 Oct 2026
++
++A working draft for the submission form. Items marked **[CONFIRM]** depend on something I cannot see from the repo.
++**No official must-have list or judging rubric is in the repository**, so the mapping table below covers only the items
++mentioned in the team messages. Paste the organisers' list into it before submitting; do not treat it as complete.
++
++## 1. Project description (draft)
++
++**Lakshya: the academic assistant.** Track: Best Apps and Agents. [CONFIRM the exact track name on the form]
++
++Faculty who report Course Outcome (CO) attainment today build the sheet by hand from quiz marks. Lakshya turns
++lecture slides and quiz attempts into that sheet. A faculty member uploads a slide deck; the app splits it into slide
++chunks and links each chunk to the subject's COs. AI drafts quiz questions; **a faculty member approves every question
++before any student can see it.** Students attempt published quizzes (two attempts per quiz), and the app computes
++per-CO marks, a class CO sheet, the number of students above and below the threshold, and a weak-CO flag for any CO below
++its target. The sheet exports to Excel. Students see only their own progress, and get slide-grounded Q&A that cites
++the slide or refuses, flashcards and notes per module, and a study plan built around their weak COs.
++
++Design rules that the code enforces and the tests check:
++- **No LLM computes a mark.** Grading, CO totals, attainment and the weak-CO flag are plain code with unit tests.
++- **AI generates, humans approve.** The database refuses to publish a quiz that contains an unapproved question.
++- **A student only ever reaches their own data**, taken from the login token, never from the request.
++- **AI runs once per module upload**, not once per student. Flashcards and notes are generated per module.
++- Synthetic data only: invented names and USNs.
++
++Where the sponsors' technology is used **[CONFIRM with Danwin before writing this on the form]**:
++- **Nebius Token Factory:** all AI calls go through one client (`ai/token_factory.py`): CO tagging at upload, question
++  generation, slide Q&A, flashcards and notes, study-plan wording. Every call is logged to `agent_logs` with token counts,
++  which feeds the usage summary.
++- **NVIDIA Nemotron models:** the model IDs are set by environment variables (`MODEL_TAGGING`, `MODEL_GENERATION`,
++  `MODEL_REASONING`, `MODEL_AGENT`). As of 28 Oct the repo shows no real run against a Nemotron model; Danwin's Nemotron test
++  tasks are unchecked. Name the models only after they have actually been called.
++- **Nebius hosting:** the upload pipeline is a plain function that could run as a Nebius Serverless Job, but
++  `decisions.md` marks that optional. Do not claim Nebius hosting unless the demo is actually deployed there. The backend
++  deploy config targets Render.
++
++## 2. Requirement mapping (only the items named in the team messages)
++
++| Requirement | Where it is met | Status on 28 Oct |
++|---|---|---|
++| Working hosted demo URL | Backend on Render (Aparna), frontend host not decided in the repo | **Not live.** README says "TODO: URL". |
++| Public repo with a license | MIT, `LICENSE` | Done |
++| README with run instructions | `README.md` (setup, seed, tests, deploy) | Done, needs a final read-through once the demo URL exists |
++| Demo video under 3 minutes, public on YouTube, no copyrighted music or third-party trademarks | Not made | **Not started.** Owner not agreed. |
++| Track named, and where Nemotron, Token Factory and Nebius are used | Section 1 above | Draft. **[CONFIRM]** Nemotron and Nebius usage |
++| Working end-to-end chain, not slides | Backend routes tested locally (see `TEST_RESULTS.md`) | Backend only, local database only. No frontend API client yet, so no screen is connected. |
++| Agent | `ai/`, `agent_tools.py`; `POST /agent/chat` | **Not registered in `main.py`.** Planned in the contract. Do not present as working. |
++| [add the organisers' remaining must-haves here] | | |
++
++## 3. Feedback notes (my part, for the shared form)
++
++Only what I actually did, so nothing here is about the platform's quality:
++- I built the Q&A, flashcard and study-plan features against Danwin's client behind a small callable interface, so they run with no key
++  and fall back to slide text. That made them testable offline with a fake client; real-model behaviour is untested.
++- Retrieval: no embedding model was confirmed, so I used keyword scoring over Postgres chunks (`decisions.md` #1). It cannot match
++  meaning, only words.
++- **[TO ADD after a real-credential test]:** latency, JSON validity rate, token counts per step (the usage summary will show these), and
++  anything that surprised us on Token Factory.
++
++## 4. Demo video plan (about 2 min 45 s), using only flows that work
++
++Prerequisite: the hosted demo is up, seeded, and a frontend is connected (neither is true yet). Seeded logins are in the README.
++
++| Time | Scene | Shows |
++|---|---|---|
++| 0:00 to 0:15 | Problem | Faculty build the CO sheet by hand |
++| 0:15 to 0:40 | Faculty uploads a deck | Status moves to done; coverage per CO, with a warning where a CO has no slides |
++| 0:40 to 1:05 | Question review | AI-drafted questions, faculty approves; an unapproved question cannot be published |
++| 1:05 to 1:35 | CO sheet | Sheet, class summary, CO3 flagged weak (56.7% against a 60% target), drill-down to the students and questions |
++| 1:35 to 1:50 | Excel export | The downloaded sheet matches the screen |
++| 1:50 to 2:15 | Student view | A student sees only their own progress; one attempt, then the sheet changes |
++| 2:15 to 2:35 | Study help | Slide Q&A with a cited slide, then a refusal for an off-topic question; study plan for the weak CO |
++| 2:35 to 2:45 | Close | Rules: AI drafts, humans approve, no AI computes a mark |
++
++Record with the seeded data only. Check the video for real names, keys in screenshots, third-party logos and music before uploading.
++
++## 5. Still to decide
++
++- Who records and edits the video, and who fills in the form.
++- The frontend owner (see `arya-integration-notes.md`), because the demo needs screens.
++- The real submission deadline.
+diff -ruN -x __pycache__ -x node_modules -x '*.pyc' -x .pytest_cache a/docs/team/arya.md ./docs/team/arya.md
+--- a/docs/team/arya.md	2026-10-23 08:36:40.000000000 +0000
++++ ./docs/team/arya.md	2026-10-28 02:37:43.213747553 +0000
+@@ -96,6 +96,29 @@
+ - [ ] Log every AI call and every tool call to AgentLog, with the token counts Danwin returns.
+ - [ ] Provide the totals per step that Danwin's cost page reads.
+ 
++## Status (28 Oct 2026)
++
++Checkboxes above are left as written until each item is confirmed on the hosted database. "Tested" means
++the integration tests in `tests/backend/test_arya_integration.py` pass on a local Postgres 16 with migrations
++001 to 003; nothing here has been run on Supabase or Render yet.
++
++| Task | State |
++|---|---|
++| 1 Repo, license, README | Done earlier. README seed and test sections updated. |
++| 2 Seed data | Runner written and tested locally (`python -m seed.seed`). **Not yet run on the hosted database.** |
++| 3 PPT parsing, chunks, coverage | Routes wired to Postgres and tested (upload status transitions, tags, coverage). Tagging was tested with a stub; **real AI tagging untested**. |
++| 4 Grading and CO marks | Unit tests pass. Submission and the `counted` flag are Aparna's code; sheet consistency tested. |
++| 5 Publish and attempts | Done by Aparna (`quizzes_admin.py`, `attempts.py`). Not mine to change. |
++| 6 CO sheet, summary, drill-down, weak CO | Wired and tested, including "change one answer and the sheet moves". |
++| 7 Excel export | Tested against the on-screen sheet. **Format not confirmed with faculty.** |
++| 8 Slide Q&A | Wired with keyword retrieval (see decisions.md #1). Real AI answers untested. |
++| 9 Study plan | Wired and tested. Open question: unattempted COs count as weak (see below). |
++| 10 Flashcards and notes | Wired and tested (slide-text fallback). AI version untested. |
++| 11 Calendar | Wired and tested. Quiz events are created by Aparna's publish. |
++| 12 Usage logging | Wired and tested with a fake client. Real token counts untested. |
++
++Not done: the frontend API client and screens, the submission work, and anything on the hosted environment.
++
+ ## Submission work (outside the points)
+ 
+ - Write the project description. Name the track (Best Apps and Agents) and say where Nemotron, Token Factory and Nebius are used.
+@@ -114,6 +137,8 @@
+ | Excel format the university uses | You |
+ | Retrieval for slide Q&A: pgvector or in-memory | Danwin and you, in the first build |
+ | Who keeps the demo URL up through judging | Aparna |
++| Who owns the frontend API client and the screens (tasks 8 to 13)? `aparna.md`, `danwin.md` and Aparna's message disagree, see `docs/arya-integration-notes.md` | Whole team |
++| Should a study plan include COs the student has not been assessed on yet? Today it does | Faculty and team |
+ 
+ ## Hand-offs
+ 
+diff -ruN -x __pycache__ -x node_modules -x '*.pyc' -x .pytest_cache a/seed/seed.py ./seed/seed.py
+--- a/seed/seed.py	1970-01-01 00:00:00.000000000 +0000
++++ ./seed/seed.py	2026-10-25 10:17:51.753951393 +0000
+@@ -0,0 +1,160 @@
++"""Load the synthetic demo data into the database in DATABASE_URL.
++
++    python -m seed.seed --yes            # load (safe to run twice: rows have fixed ids)
++    python -m seed.seed --remove --yes   # delete ONLY the rows this script created
++
++Everything is invented: fake names, fake USNs (1XX23CS001..060), no real students.
++
++What this runner fixes compared with printing seed_data.generate_sql():
++  * The database refuses a published quiz that has no approved questions yet, so
++    quizzes are inserted as drafts, their questions are linked, and only then published.
++  * The generator's password hashes are placeholders that never verify. Real bcrypt
++    hashes are created here, so the demo logins work.
++  * It also adds the calendar events for the published quizzes and the flashcards and
++    notes for each module (built from the slide text, no AI call needed).
++
++It never deletes anything it did not create, and never truncates tables.
++"""
++
++from __future__ import annotations
++
++import argparse
++import dataclasses
++import os
++import sys
++from datetime import datetime, timezone
++from urllib.parse import urlsplit
++
++ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
++for p in (ROOT, os.path.join(ROOT, "backend")):
++    if p not in sys.path:
++        sys.path.insert(0, p)
++
++import bcrypt  # noqa: E402
++from dotenv import load_dotenv  # noqa: E402
++from sqlalchemy import create_engine, text  # noqa: E402
++
++from seed.seed_data import (  # noqa: E402
++    SYNTHETIC_PASSWORD_HASH,
++    SYNTHETIC_PIN_HASH,
++    SeedData,
++    generate_seed_data,
++    generate_sql,
++)
++
++DEMO_FACULTY_PASSWORD = "Demo@12345"
++DEMO_STUDENT_PIN = "123456"
++
++
++def _hash(secret: str) -> str:
++    return bcrypt.hashpw(secret.encode(), bcrypt.gensalt()).decode()
++
++
++def _database_url() -> str:
++    load_dotenv(os.path.join(ROOT, ".env"))
++    url = os.getenv("DATABASE_URL", "").strip()
++    if not url:
++        sys.exit("DATABASE_URL is not set. Put it in .env (never commit it).")
++    if url.startswith("postgresql://"):
++        url = "postgresql+psycopg://" + url[len("postgresql://"):]
++    return url
++
++
++def _describe(url: str) -> str:
++    parts = urlsplit(url.replace("postgresql+psycopg", "postgresql", 1))
++    return f"{parts.hostname}:{parts.port or 5432}{parts.path}"  # no user or password
++
++
++def build_sql(seed: SeedData) -> str:
++    """The generator's SQL with the two fixes applied."""
++    published = [q for q in seed.quizzes if q["published"]]
++    drafts = [dict(q, published=False, published_at=None) for q in seed.quizzes]
++    sql = generate_sql(dataclasses.replace(seed, quizzes=drafts))
++
++    sql = sql.replace(SYNTHETIC_PIN_HASH, _hash(DEMO_STUDENT_PIN))
++    sql = sql.replace(SYNTHETIC_PASSWORD_HASH, _hash(DEMO_FACULTY_PASSWORD))
++
++    after = ["-- Publish only now that every quiz has its approved questions"]
++    for q in published:
++        after.append(
++            f"UPDATE quizzes SET published = TRUE, published_at = '{q['published_at']}' "
++            f"WHERE id = '{q['id']}';"
++        )
++        after.append(
++            "INSERT INTO events (subject_id, type, title, starts_at, ends_at, quiz_id, created_by) "
++            f"SELECT '{q['subject_id']}', 'quiz', '{q['title'].replace(chr(39), chr(39) * 2)}', "
++            f"'{q['opens_at']}', '{q['closes_at']}', '{q['id']}', '{q['created_by']}' "
++            f"WHERE NOT EXISTS (SELECT 1 FROM events WHERE quiz_id = '{q['id']}');"
++        )
++    head, _, _ = sql.rpartition("COMMIT;")
++    return head + "\n".join(after) + "\nCOMMIT;\n"
++
++
++def load(engine) -> None:
++    seed = generate_seed_data()
++    sql = build_sql(seed)
++    raw = engine.raw_connection()
++    try:
++        with raw.cursor() as cur:
++            cur.execute(sql)
++        raw.commit()
++    except Exception:
++        raw.rollback()
++        raise
++    finally:
++        raw.close()
++
++    # Flashcards and notes from slide text, once per module.
++    from app.pg.chunks import module_chunks_with_co
++    from app.pg.study import PostgresStudyMaterialStore
++    from app.services.study_material import generate_module_study_material
++
++    with engine.begin() as conn:
++        store = PostgresStudyMaterialStore(conn)
++        for m in seed.modules:
++            chunks = module_chunks_with_co(conn, m["id"])
++            if chunks:
++                generate_module_study_material(store, m["id"], m["title"], chunks)
++
++    print(f"Loaded: {len(seed.students)} students, {len(seed.questions)} questions, "
++          f"{len(seed.quizzes)} quizzes, {len(seed.quiz_attempts)} attempts.")
++    print()
++    print("Demo logins (invented):")
++    print(f"  Faculty : {seed.faculty_user['email']} / {DEMO_FACULTY_PASSWORD}")
++    print(f"  Student : {seed.students[0]['usn']} / {DEMO_STUDENT_PIN}   (all students use this PIN)")
++    print(f"  Weak in CO3: the last ~26 students (Section B), e.g. {seed.students[-1]['usn']}")
++
++
++def remove(engine) -> None:
++    """Delete only the rows created by load(), found through their fixed ids."""
++    seed = generate_seed_data()
++    subject_id = seed.subject["id"]
++    student_ids = [s["id"] for s in seed.students]
++    with engine.begin() as conn:
++        # Quizzes first: quiz_questions protects questions from deletion.
++        conn.execute(text("DELETE FROM quizzes WHERE subject_id = :s"), {"s": subject_id})
++        conn.execute(text("DELETE FROM subjects WHERE id = :s"), {"s": subject_id})
++        conn.execute(text("DELETE FROM students WHERE id = ANY(CAST(:ids AS uuid[]))"),
++                     {"ids": "{" + ",".join(student_ids) + "}"})
++        conn.execute(text("DELETE FROM users WHERE id = :u"), {"u": seed.faculty_user["id"]})
++    print("Removed the seed subject, its students and the seed faculty user.")
++
++
++def main() -> None:
++    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
++    ap.add_argument("--remove", action="store_true", help="delete only the rows this script created")
++    ap.add_argument("--yes", action="store_true", help="do not ask for confirmation")
++    args = ap.parse_args()
++
++    url = _database_url()
++    action = "REMOVE the seed data from" if args.remove else "LOAD the seed data into"
++    print(f"About to {action}: {_describe(url)}")
++    if not args.yes and input("Type 'yes' to continue: ").strip().lower() != "yes":
++        sys.exit("Cancelled.")
++
++    engine = create_engine(url, pool_pre_ping=True)
++    (remove if args.remove else load)(engine)
++
++
++if __name__ == "__main__":
++    main()
+diff -ruN -x __pycache__ -x node_modules -x '*.pyc' -x .pytest_cache a/tests/backend/test_arya_integration.py ./tests/backend/test_arya_integration.py
+--- a/tests/backend/test_arya_integration.py	1970-01-01 00:00:00.000000000 +0000
++++ ./tests/backend/test_arya_integration.py	2026-10-27 17:33:18.439006775 +0000
+@@ -0,0 +1,700 @@
++"""Integration tests for Arya's routes, run against the real Postgres database.
++
++Covers: permissions, upload status transitions, quiz submission -> CO sheet
++consistency (including the `counted` flag), the Excel export, coverage, slide Q&A,
++study material and plan, the calendar, and usage logging.
++
++No Token Factory key is needed. AI-backed paths are tested with a fake client that
++returns canned text and token counts, which proves the wiring and the logging, not
++the quality of any model. Real-credential tests belong in tests/integration/.
++
++Every test creates its own rows through the `ctx` fixture (which removes them) and
++never deletes anything it did not create.
++"""
++
++from __future__ import annotations
++
++import io
++import uuid
++from datetime import datetime, timedelta, timezone
++from types import SimpleNamespace
++
++import openpyxl
++import pytest
++from pptx import Presentation
++from sqlalchemy import text
++
++PPTX_MIME = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
++NOT_A_FACULTY = {403}
++
++
++# ---------------------------------------------------------------------------
++# Helpers and fixtures
++# ---------------------------------------------------------------------------
++
++@pytest.fixture(autouse=True)
++def _no_ai_credentials(monkeypatch):
++    """Fallback paths by default: no key, no models."""
++    for name in ("TOKEN_FACTORY_API_KEY", "TOKEN_FACTORY_BASE_URL", "MODEL_TAGGING",
++                 "MODEL_GENERATION", "MODEL_AGENT", "MODEL_REASONING"):
++        monkeypatch.delenv(name, raising=False)
++
++
++@pytest.fixture
++def log_cleanup(db):
++    """Remove only the agent_logs rows written by the fake model."""
++    yield
++    try:
++        db.rollback()
++        db.execute(text("DELETE FROM agent_logs WHERE model = 'fake-model'"))
++        db.commit()
++    except Exception:
++        db.rollback()
++
++
++def _tok(ctx, **creds):
++    resp = ctx.login(**creds)
++    assert resp.status_code == 200, resp.text
++    return ctx.headers(resp.json()["access_token"])
++
++
++def _make_deck(slides: list[tuple[str, str]]) -> bytes:
++    prs = Presentation()
++    for title, body in slides:
++        slide = prs.slides.add_slide(prs.slide_layouts[1])
++        slide.shapes.title.text = title
++        slide.placeholders[1].text = body
++    buf = io.BytesIO()
++    prs.save(buf)
++    return buf.getvalue()
++
++
++DECK = _make_deck([
++    ("Binary search tree", "A binary search tree keeps smaller keys in the left subtree and larger keys in the right subtree."),
++    ("Tree traversal", "Inorder traversal visits left subtree, node, then right subtree and returns keys in sorted order."),
++    ("Hash tables", "A hash table maps keys to buckets using a hash function and resolves collisions by chaining."),
++])
++
++
++def _world(ctx, db, *, sections=("A", "B")):
++    """Faculty, subject with CO1 and CO2, one module, four approved questions
++    (q1,q2 -> CO1 correct option 0; q3,q4 -> CO2 correct option 1), a published
++    open quiz and one enrolled student per section."""
++    fac = ctx.make_faculty()
++    subj = ctx.make_subject(fac["user_id"])
++    sid = subj["subject_id"]
++    co1 = ctx.make_co(sid, 1, "CO1 trees")
++    co2 = ctx.make_co(sid, 2, "CO2 hashing")
++    mod = ctx.make_module(sid, 1, "Module 1")
++    qs = []
++    for i, (co, correct) in enumerate([(co1, 0), (co1, 0), (co2, 1), (co2, 1)]):
++        qs.append(ctx.make_question(
++            mod["module_id"], co["co_id"], faculty_user_id=fac["user_id"], status="approved",
++            stem=f"Question {i + 1}", correct_option=correct, opts=["A", "B", "C", "D"],
++        ))
++    quiz = ctx.make_quiz(mod["module_id"], sid, faculty_user_id=fac["user_id"],
++                         question_ids=[q["question_id"] for q in qs])
++    now = datetime.now(timezone.utc)
++    db.execute(
++        text("UPDATE quizzes SET opens_at = :o, closes_at = :c, published = true, "
++             "published_at = now() WHERE id = :id"),
++        {"o": now - timedelta(hours=1), "c": now + timedelta(hours=2), "id": quiz["quiz_id"]},
++    )
++    db.commit()
++    students = []
++    for sec in sections:
++        st = ctx.make_student()
++        ctx.make_enrollment(st["student_id"], sid, sec)
++        students.append(st)
++    return SimpleNamespace(
++        fac=fac, sid=sid, co1=co1, co2=co2, mod=mod, qs=qs, quiz=quiz["quiz_id"],
++        students=students, fh=_tok(ctx, email=fac["email"], password=fac["password"]),
++    )
++
++
++def _attempt(client, ctx, student, quiz_id, answers_by_index):
++    """Start and submit one attempt. answers_by_index: option for q1..q4 (None = skip)."""
++    h = _tok(ctx, usn=student["usn"], pin=student["pin"])
++    r = client.post(f"/quizzes/{quiz_id}/attempts", headers=h)
++    assert r.status_code == 201, r.text
++    body = r.json()
++    ids = [q["id"] for q in body["questions"]]
++    # Questions are returned in quiz order; map by stem to be safe.
++    by_stem = {q["id"]: q.get("stem") for q in body["questions"]}
++    order = sorted(ids, key=lambda i: by_stem[i])  # "Question 1".."Question 4"
++    answers = {qid: opt for qid, opt in zip(order, answers_by_index) if opt is not None}
++    sub = client.post(f"/attempts/{body['attempt_id']}/submit", headers=h, json={"answers": answers})
++    assert sub.status_code == 200, sub.text
++    return body["attempt_id"], sub.json()
++
++
++ALL_RIGHT = [0, 0, 1, 1]
++ALL_WRONG = [3, 3, 3, 3]
++CO1_RIGHT_CO2_WRONG = [0, 0, 3, 3]
++
++
++def _sheet_row(client, w, usn, **params):
++    r = client.get(f"/subjects/{w.sid}/co-sheet", headers=w.fh, params=params)
++    assert r.status_code == 200, r.text
++    return next(row for row in r.json()["rows"] if row["usn"] == usn), r.json()
++
++
++# ---------------------------------------------------------------------------
++# 1. Permissions
++# ---------------------------------------------------------------------------
++
++def _faculty_gets(w):
++    mid, sid, co = w.mod["module_id"], w.sid, w.co1["co_id"]
++    return [
++        f"/subjects/{sid}/co-sheet", f"/subjects/{sid}/co-summary", f"/subjects/{sid}/weak-cos",
++        f"/subjects/{sid}/coverage", f"/subjects/{sid}/co-sheet/export",
++        f"/subjects/{sid}/cos/{co}/drilldown", f"/modules/{mid}/status",
++    ]
++
++
++def test_no_token_is_401_everywhere(client, ctx, db):
++    w = _world(ctx, db)
++    for path in _faculty_gets(w) + ["/usage/summary", "/events", "/students/me/progress?subject_id=" + w.sid]:
++        assert client.get(path).status_code == 401, path
++    assert client.post("/qa", json={"subject_id": w.sid, "question": "what is a tree"}).status_code == 401
++
++
++def test_student_cannot_use_faculty_routes(client, ctx, db):
++    w = _world(ctx, db)
++    sh = _tok(ctx, usn=w.students[0]["usn"], pin=w.students[0]["pin"])
++    for path in _faculty_gets(w) + ["/usage/summary"]:
++        r = client.get(path, headers=sh)
++        assert r.status_code == 403, (path, r.status_code)
++    mid = w.mod["module_id"]
++    assert client.post(f"/modules/{mid}/study-material", headers=sh).status_code == 403
++    assert client.post(f"/modules/{mid}/upload", headers=sh,
++                       files={"file": ("d.pptx", DECK, PPTX_MIME)}).status_code == 403
++    r = client.post("/events", headers=sh, json={"subject_id": w.sid, "type": "quiz", "title": "x",
++                                                  "starts_at": "2030-01-01T10:00:00Z"})
++    assert r.status_code == 403
++
++
++def test_other_faculty_gets_404_not_data(client, ctx, db):
++    w = _world(ctx, db)
++    other = ctx.make_faculty()
++    oh = _tok(ctx, email=other["email"], password=other["password"])
++    for path in _faculty_gets(w):
++        r = client.get(path, headers=oh)
++        assert r.status_code == 404, (path, r.status_code)
++    mid = w.mod["module_id"]
++    assert client.post(f"/modules/{mid}/study-material", headers=oh).status_code == 404
++    assert client.post(f"/modules/{mid}/upload", headers=oh,
++                       files={"file": ("d.pptx", DECK, PPTX_MIME)}).status_code == 404
++    r = client.post("/events", headers=oh, json={"subject_id": w.sid, "type": "quiz", "title": "x",
++                                                  "starts_at": "2030-01-01T10:00:00Z"})
++    assert r.status_code == 404
++    # The other faculty member's calendar and usage views never include this subject.
++    assert client.get("/events", headers=oh).json() == []
++    # The module was not touched by the rejected upload.
++    status = db.execute(text("SELECT processing_status FROM modules WHERE id = :m"), {"m": mid}).scalar()
++    assert status == "pending"
++
++
++def test_unenrolled_student_gets_404(client, ctx, db):
++    w = _world(ctx, db)
++    outsider = ctx.make_student()
++    oh = _tok(ctx, usn=outsider["usn"], pin=outsider["pin"])
++    assert client.post("/qa", headers=oh, json={"subject_id": w.sid, "question": "what is a tree"}).status_code == 404
++    assert client.get("/retrieve", headers=oh, params={"subject_id": w.sid, "q": "tree"}).status_code == 404
++    assert client.get("/students/me/progress", headers=oh, params={"subject_id": w.sid}).status_code == 404
++    assert client.post("/students/me/study-plan", headers=oh, json={"subject_id": w.sid}).status_code == 404
++    assert client.get("/events", headers=oh, params={"subject_id": w.sid}).status_code == 404
++    assert client.get(f"/modules/{w.mod['module_id']}/flashcards", headers=oh).status_code == 404
++
++
++def test_student_sees_only_own_progress(client, ctx, db):
++    w = _world(ctx, db)
++    a, b = w.students
++    _attempt(client, ctx, a, w.quiz, ALL_RIGHT)
++    _attempt(client, ctx, b, w.quiz, ALL_WRONG)
++    ah = _tok(ctx, usn=a["usn"], pin=a["pin"])
++
++    mine = client.get("/students/me/progress", headers=ah, params={"subject_id": w.sid})
++    assert mine.status_code == 200, mine.text
++    assert {s["co_number"]: s["percentage"] for s in mine.json()["co_scores"]} == {1: 100.0, 2: 100.0}
++
++    # Another student's USN, in any spelling, is refused.
++    for usn in (b["usn"], b["usn"].lower()):
++        r = client.get(f"/students/{usn}/progress", headers=ah, params={"subject_id": w.sid})
++        assert r.status_code == 403, usn
++    # Own USN through the by-USN route works; the faculty member can read both.
++    assert client.get(f"/students/{a['usn']}/progress", headers=ah, params={"subject_id": w.sid}).status_code == 200
++    rb = client.get(f"/students/{b['usn']}/progress", headers=w.fh, params={"subject_id": w.sid})
++    assert rb.status_code == 200
++    assert {s["co_number"]: s["percentage"] for s in rb.json()["co_scores"]} == {1: 0.0, 2: 0.0}
++
++
++def test_malformed_ids_are_404_not_500(client, ctx, db):
++    w = _world(ctx, db)
++    for path in ("/subjects/not-a-uuid/co-sheet", "/modules/xyz/status",
++                 f"/subjects/{w.sid}/cos/123/drilldown"):
++        assert client.get(path, headers=w.fh).status_code == 404, path
++
++
++def test_student_events_are_filtered_by_section(client, ctx, db):
++    w = _world(ctx, db)
++    a, b = w.students  # sections A and B
++    for section in ("A", "B", None):
++        r = client.post("/events", headers=w.fh, json={
++            "subject_id": w.sid, "type": "quiz", "title": f"for {section}", "section": section,
++            "starts_at": "2030-01-01T10:00:00Z"})
++        assert r.status_code == 201, r.text
++    titles = lambda s: sorted(e["title"] for e in client.get(
++        "/events", headers=_tok(ctx, usn=s["usn"], pin=s["pin"])).json())
++    assert titles(a) == ["for A", "for None"]
++    assert titles(b) == ["for B", "for None"]
++    assert len(client.get("/events", headers=w.fh).json()) == 3
++
++
++# ---------------------------------------------------------------------------
++# 2. Upload and status transitions
++# ---------------------------------------------------------------------------
++
++def _status(client, w):
++    r = client.get(f"/modules/{w.mod['module_id']}/status", headers=w.fh)
++    assert r.status_code == 200, r.text
++    return r.json()
++
++
++def _upload(client, w, data=DECK, name="deck.pptx"):
++    return client.post(f"/modules/{w.mod['module_id']}/upload", headers=w.fh,
++                       files={"file": (name, data, PPTX_MIME)})
++
++
++def test_upload_pending_to_done_without_ai(client, ctx, db):
++    w = _world(ctx, db)
++    assert _status(client, w)["processing_status"] == "pending"
++    r = _upload(client, w)
++    assert r.status_code == 202, r.text
++    assert r.json()["processing_status"] == "processing"  # what the client is told straight away
++    st = _status(client, w)
++    assert st["processing_status"] == "done"
++    assert st["chunks_total"] == 3
++    # No AI: chunks are kept, untagged, and the upload still succeeds.
++    assert st["chunks_tagged"] == 0 and st["chunks_untagged"] == 3
++    assert st["error"] is None
++    cov = client.get(f"/subjects/{w.sid}/coverage", headers=w.fh).json()
++    assert [c["chunk_count"] for c in cov] == [0, 0] and all(c["warning"] for c in cov)
++
++
++def test_status_is_processing_while_the_job_runs_and_blocks_a_second_upload(client, ctx, db, monkeypatch):
++    from backend.app.routers import upload as upload_router
++    monkeypatch.setattr(upload_router, "run_upload_pipeline", lambda *a, **k: None)  # job never finishes
++    w = _world(ctx, db)
++    assert _upload(client, w).status_code == 202
++    assert _status(client, w)["processing_status"] == "processing"
++    again = _upload(client, w)
++    assert again.status_code == 409 and again.json()["error"]["code"] == "CONFLICT"
++
++
++def test_corrupt_file_ends_failed_with_a_reason(client, ctx, db):
++    w = _world(ctx, db)
++    assert _upload(client, w, data=b"PK" + b"\x00" * 200).status_code == 202
++    st = _status(client, w)
++    assert st["processing_status"] == "failed"
++    assert st["error"]
++    assert st["chunks_total"] == 0
++    # A good file afterwards recovers the module.
++    assert _upload(client, w).status_code == 202
++    assert _status(client, w)["processing_status"] == "done"
++
++
++def test_upload_input_validation(client, ctx, db):
++    w = _world(ctx, db)
++    assert _upload(client, w, name="notes.pdf").status_code == 400
++    assert _upload(client, w, data=b"not a zip at all").status_code == 400
++    assert _status(client, w)["processing_status"] == "pending"  # nothing started
++
++
++def test_tagging_failure_does_not_fail_the_upload(client, ctx, db, monkeypatch):
++    from backend.app.routers import upload as upload_router
++
++    def boom(chunks, cos):
++        raise RuntimeError("provider down")
++
++    monkeypatch.setattr(upload_router, "make_tagger", lambda client_, rec: boom)
++    w = _world(ctx, db)
++    assert _upload(client, w).status_code == 202
++    st = _status(client, w)
++    assert st["processing_status"] == "done"
++    assert st["chunks_total"] == 3 and st["chunks_untagged"] == 3
++
++
++def test_tags_are_stored_and_coverage_counts_them(client, ctx, db, monkeypatch):
++    from backend.app.routers import upload as upload_router
++
++    def tagger(chunks, cos):
++        # slide 1,2 -> CO1 ; slide 3 -> CO2 ; slide 1 also CO2
++        out = []
++        for c in chunks:
++            numbers = {1: (1, 2), 2: (1,), 3: (2,)}[c.slide_number]
++            out.append({"chunk_id": c.id, "cos": list(numbers), "confidence": 0.9})
++        return out
++
++    monkeypatch.setattr(upload_router, "make_tagger", lambda client_, rec: tagger)
++    w = _world(ctx, db)
++    assert _upload(client, w).status_code == 202
++    st = _status(client, w)
++    assert st["processing_status"] == "done" and st["chunks_tagged"] == 3
++    cov = {c["co_number"]: c for c in client.get(f"/subjects/{w.sid}/coverage", headers=w.fh).json()}
++    assert cov[1]["chunk_count"] == 2 and cov[2]["chunk_count"] == 2
++    assert not cov[1]["warning"] and not cov[2]["warning"]
++
++
++def test_reupload_replaces_chunks_instead_of_adding(client, ctx, db):
++    w = _world(ctx, db)
++    _upload(client, w)
++    _upload(client, w, data=_make_deck([("Only slide", "A single slide about stacks and queues.")]))
++    st = _status(client, w)
++    assert st["processing_status"] == "done" and st["chunks_total"] == 1
++
++
++# ---------------------------------------------------------------------------
++# 3. Quiz submission -> CO sheet consistency
++# ---------------------------------------------------------------------------
++
++def _counted_rows(db, w, usn):
++    return db.execute(text(
++        "SELECT c.number, s.percentage, s.counted, s.attempt_id FROM student_co_scores s "
++        "JOIN students st ON st.id = s.student_id JOIN course_outcomes c ON c.id = s.co_id "
++        "WHERE st.usn = :u AND s.subject_id = :sid ORDER BY c.number, s.counted DESC"),
++        {"u": usn, "sid": w.sid}).fetchall()
++
++
++def test_sheet_matches_the_counted_flag_after_submissions(client, ctx, db):
++    w = _world(ctx, db)
++    a, b = w.students
++    _attempt(client, ctx, a, w.quiz, ALL_WRONG)          # A attempt 1: 0 / 0
++    _attempt(client, ctx, a, w.quiz, ALL_RIGHT)          # A attempt 2: 100 / 100  (best)
++    _attempt(client, ctx, b, w.quiz, CO1_RIGHT_CO2_WRONG)  # B attempt 1: 100 / 0
++
++    row_a, _ = _sheet_row(client, w, a["usn"])
++    row_b, _ = _sheet_row(client, w, b["usn"])
++    assert (row_a["co_scores"]["CO1"], row_a["co_scores"]["CO2"]) == (100.0, 100.0)
++    assert (row_b["co_scores"]["CO1"], row_b["co_scores"]["CO2"]) == (100.0, 0.0)
++
++    # Exactly one counted attempt per student and CO, and it equals the sheet.
++    for st, row in ((a, row_a), (b, row_b)):
++        rows = _counted_rows(db, w, st["usn"])
++        for co in (1, 2):
++            counted = [r for r in rows if r[0] == co and r[2]]
++            assert len(counted) == 1, (st["usn"], co)
++            assert float(counted[0][1]) == pytest.approx(row["co_scores"][f"CO{co}"])
++
++
++def test_changing_one_answer_moves_the_sheet_summary_and_counted_flag(client, ctx, db):
++    w = _world(ctx, db)
++    a, b = w.students
++    _attempt(client, ctx, a, w.quiz, ALL_RIGHT)
++    first_attempt, _ = _attempt(client, ctx, b, w.quiz, CO1_RIGHT_CO2_WRONG)
++
++    summary = {s["co_number"]: s for s in client.get(f"/subjects/{w.sid}/co-summary", headers=w.fh).json()}
++    assert summary[2]["average"] == pytest.approx(50.0)
++    assert (summary[2]["above"], summary[2]["below"]) == (1, 1)
++    assert summary[2]["attainment_pct"] == pytest.approx(50.0)
++    assert summary[2]["met"] is False  # 50% of students above 60% vs a 60% target
++    weak = client.get(f"/subjects/{w.sid}/weak-cos", headers=w.fh).json()
++    assert [x["co_number"] for x in weak] == [2]
++
++    # B fixes the two CO2 answers on the second attempt.
++    second_attempt, body = _attempt(client, ctx, b, w.quiz, ALL_RIGHT)
++    assert body["total_score"] == 4.0
++
++    row_b, _ = _sheet_row(client, w, b["usn"])
++    assert row_b["co_scores"]["CO2"] == 100.0
++    summary = {s["co_number"]: s for s in client.get(f"/subjects/{w.sid}/co-summary", headers=w.fh).json()}
++    assert summary[2]["average"] == pytest.approx(100.0)
++    assert summary[2]["met"] is True
++    assert client.get(f"/subjects/{w.sid}/weak-cos", headers=w.fh).json() == []
++    # The counted flag moved to the new attempt (best rule), still exactly one per CO.
++    co2 = [r for r in _counted_rows(db, w, b["usn"]) if r[0] == 2]
++    assert [str(r[3]) for r in co2 if r[2]] == [second_attempt]
++    assert len([r for r in co2 if r[2]]) == 1
++
++
++def test_a_third_attempt_is_refused_and_leaves_the_sheet_alone(client, ctx, db):
++    w = _world(ctx, db)
++    st = w.students[0]
++    _attempt(client, ctx, st, w.quiz, ALL_RIGHT)
++    _attempt(client, ctx, st, w.quiz, ALL_WRONG)
++    h = _tok(ctx, usn=st["usn"], pin=st["pin"])
++    r = client.post(f"/quizzes/{w.quiz}/attempts", headers=h)
++    assert r.status_code == 409, r.text
++    row, _ = _sheet_row(client, w, st["usn"])
++    assert row["co_scores"]["CO1"] == 100.0  # best of the two
++
++
++def test_unattempted_students_show_no_score_not_zero(client, ctx, db):
++    w = _world(ctx, db)
++    _attempt(client, ctx, w.students[0], w.quiz, ALL_RIGHT)
++    row, _ = _sheet_row(client, w, w.students[1]["usn"])
++    assert row["co_scores"]["CO1"] is None and row["co_scores"]["CO2"] is None
++
++
++def test_section_filter_and_module_scope(client, ctx, db):
++    w = _world(ctx, db)
++    a, b = w.students
++    _attempt(client, ctx, a, w.quiz, ALL_RIGHT)
++    _attempt(client, ctx, b, w.quiz, ALL_WRONG)
++    r = client.get(f"/subjects/{w.sid}/co-sheet", headers=w.fh, params={"section": "A"})
++    assert [x["usn"] for x in r.json()["rows"]] == [a["usn"]]
++    # scope=module needs a module, and the module must belong to this subject.
++    assert client.get(f"/subjects/{w.sid}/co-sheet", headers=w.fh, params={"scope": "module"}).status_code == 400
++    ok = client.get(f"/subjects/{w.sid}/co-sheet", headers=w.fh,
++                    params={"scope": "module", "module_id": w.mod["module_id"]})
++    assert ok.status_code == 200
++    foreign = client.get(f"/subjects/{w.sid}/co-sheet", headers=w.fh,
++                         params={"scope": "module", "module_id": str(uuid.uuid4())})
++    assert foreign.status_code == 404
++    assert client.get(f"/subjects/{w.sid}/co-sheet", headers=w.fh, params={"scope": "week"}).status_code == 422
++
++
++def test_drilldown_shows_the_students_and_questions_behind_the_number(client, ctx, db):
++    w = _world(ctx, db)
++    a, b = w.students
++    _attempt(client, ctx, a, w.quiz, ALL_RIGHT)
++    _attempt(client, ctx, b, w.quiz, CO1_RIGHT_CO2_WRONG)
++    r = client.get(f"/subjects/{w.sid}/cos/{w.co2['co_id']}/drilldown", headers=w.fh)
++    assert r.status_code == 200, r.text
++    blob = r.json()
++    flat = str(blob)
++    assert a["usn"] in flat and b["usn"] in flat
++    assert w.qs[2]["question_id"] in flat and w.qs[3]["question_id"] in flat
++    assert w.qs[0]["question_id"] not in flat  # CO1 questions are not behind a CO2 number
++
++
++def test_excel_export_matches_the_on_screen_sheet(client, ctx, db):
++    w = _world(ctx, db)
++    a, b = w.students
++    _attempt(client, ctx, a, w.quiz, ALL_RIGHT)
++    _attempt(client, ctx, b, w.quiz, CO1_RIGHT_CO2_WRONG)
++    _, sheet = _sheet_row(client, w, a["usn"])
++
++    r = client.get(f"/subjects/{w.sid}/co-sheet/export", headers=w.fh)
++    assert r.status_code == 200
++    assert r.headers["content-type"].startswith("application/vnd.openxmlformats")
++    assert "attachment" in r.headers["content-disposition"]
++    ws = openpyxl.load_workbook(io.BytesIO(r.content)).active
++    rows = [[c.value for c in row] for row in ws.iter_rows()]
++    header_idx = next(i for i, row in enumerate(rows) if "USN" in row)
++    header = [str(x) for x in rows[header_idx]]
++    col = lambda co: next(i for i, h in enumerate(header) if h.startswith(co + " "))  # "CO1 (%)"
++    for expected in sheet["rows"]:
++        line = next(row for row in rows[header_idx + 1:] if expected["usn"] in row)
++        for co, value in expected["co_scores"].items():
++            cell = line[col(co)]
++            if value is None:
++                assert cell in (None, "", "-")
++            else:
++                assert float(cell) == pytest.approx(value, abs=0.01), (expected["usn"], co)
++
++
++# ---------------------------------------------------------------------------
++# 4. Slide Q&A, study material and study plan
++# ---------------------------------------------------------------------------
++
++def _load_chunks(ctx, db, w, tagged=True):
++    """Put the DECK slides in the module, tagged to COs, without going through upload."""
++    slides = [
++        (1, "Binary search tree: a binary search tree keeps smaller keys in the left subtree and larger keys in the right subtree.", 1),
++        (2, "Tree traversal: inorder traversal visits left subtree, node, then right subtree and returns keys in sorted order.", 1),
++        (3, "Hash tables: a hash table maps keys to buckets using a hash function and resolves collisions by chaining.", 2),
++    ]
++    for n, body, co in slides:
++        cid = db.execute(text(
++            "INSERT INTO content_chunks (module_id, slide_number, text, tag_status) "
++            "VALUES (:m, :n, :t, :s) RETURNING id"),
++            {"m": w.mod["module_id"], "n": n, "t": body, "s": "tagged" if tagged else "untagged"}).scalar()
++        if tagged:
++            co_id = (w.co1 if co == 1 else w.co2)["co_id"]
++            db.execute(text("INSERT INTO chunk_cos (chunk_id, co_id, confidence) VALUES (:c, :o, 0.9)"),
++                       {"c": cid, "o": co_id})
++    db.commit()
++
++
++def test_qa_cites_slides_and_refuses_when_nothing_matches(client, ctx, db):
++    w = _world(ctx, db)
++    _load_chunks(ctx, db, w)
++    sh = _tok(ctx, usn=w.students[0]["usn"], pin=w.students[0]["pin"])
++    hit = client.post("/qa", headers=sh, json={"subject_id": w.sid, "question": "How does inorder traversal work?"})
++    assert hit.status_code == 200, hit.text
++    body = hit.json()
++    assert body["refused"] is False and body["citations"]
++    assert 2 in [c["slide_number"] for c in body["citations"]]
++
++    miss = client.post("/qa", headers=sh, json={"subject_id": w.sid, "question": "Who won the football world cup?"})
++    assert miss.status_code == 200
++    assert miss.json()["refused"] is True and miss.json()["citations"] == []
++
++    chunks = client.get("/retrieve", headers=sh, params={"subject_id": w.sid, "q": "hash function collisions"}).json()
++    assert chunks and chunks[0]["slide_number"] == 3
++    assert client.post("/qa", headers=sh, json={"subject_id": w.sid, "question": "ab"}).status_code == 422
++
++
++def test_study_material_is_generated_once_per_module(client, ctx, db):
++    w = _world(ctx, db)
++    mid = w.mod["module_id"]
++    # No slides yet -> a clear 409, not an empty success.
++    assert client.post(f"/modules/{mid}/study-material", headers=w.fh).status_code == 409
++    _load_chunks(ctx, db, w)
++    first = client.post(f"/modules/{mid}/study-material", headers=w.fh)
++    assert first.status_code == 200, first.text
++    n_cards = len(first.json()["flashcards"])
++    assert n_cards >= 1
++    second = client.post(f"/modules/{mid}/study-material", headers=w.fh)
++    assert second.status_code == 200
++    count = db.execute(text("SELECT count(*) FROM flashcards WHERE module_id = :m"), {"m": mid}).scalar()
++    assert count == n_cards  # not duplicated
++    # Students of the subject can read it; it is per module, not per student.
++    sh = _tok(ctx, usn=w.students[0]["usn"], pin=w.students[0]["pin"])
++    assert len(client.get(f"/modules/{mid}/flashcards", headers=sh).json()) == n_cards
++    assert client.get(f"/modules/{mid}/notes", headers=sh).status_code == 200
++    regen = client.post(f"/modules/{mid}/study-material", headers=w.fh, params={"regenerate": "true"})
++    assert regen.status_code == 200
++    assert db.execute(text("SELECT count(*) FROM flashcards WHERE module_id = :m"), {"m": mid}).scalar() == n_cards
++
++
++def test_study_plan_targets_the_students_weak_co_with_real_slides(client, ctx, db):
++    w = _world(ctx, db)
++    _load_chunks(ctx, db, w)
++    client.post(f"/modules/{w.mod['module_id']}/study-material", headers=w.fh)
++    a, b = w.students
++    _attempt(client, ctx, a, w.quiz, ALL_RIGHT)
++    _attempt(client, ctx, b, w.quiz, CO1_RIGHT_CO2_WRONG)   # weak in CO2
++    bh = _tok(ctx, usn=b["usn"], pin=b["pin"])
++    ah = _tok(ctx, usn=a["usn"], pin=a["pin"])
++
++    assert client.get("/students/me/study-plan", headers=bh, params={"subject_id": w.sid}).status_code == 404
++    created = client.post("/students/me/study-plan", headers=bh, json={"subject_id": w.sid})
++    assert created.status_code == 201, created.text
++    plan = created.json()
++    steps = plan["plan"] if isinstance(plan.get("plan"), list) else plan["plan"]["steps"]
++    assert [s["co_number"] for s in steps] == [2]
++    assert [s["slide_number"] for s in steps[0]["slides"]] == [3]  # only the CO2 slide
++    got = client.get("/students/me/study-plan", headers=bh, params={"subject_id": w.sid})
++    assert got.status_code == 200 and got.json()["id"] == plan["id"]
++    # The student who is not weak has no plan, and cannot see B's.
++    assert client.get("/students/me/study-plan", headers=ah, params={"subject_id": w.sid}).status_code == 404
++
++
++# ---------------------------------------------------------------------------
++# 5. Calendar
++# ---------------------------------------------------------------------------
++
++def test_calendar_create_list_move_delete_and_validation(client, ctx, db):
++    w = _world(ctx, db)
++    r = client.post("/events", headers=w.fh, json={
++        "subject_id": w.sid, "type": "assignment", "title": "  Lab 1 due  ",
++        "starts_at": "2030-02-01T09:00:00Z", "module_id": w.mod["module_id"]})
++    assert r.status_code == 201, r.text
++    ev = r.json()
++    assert ev["title"] == "Lab 1 due"
++    moved = client.patch(f"/events/{ev['id']}", headers=w.fh, json={"starts_at": "2030-02-03T09:00:00Z"})
++    assert moved.status_code == 200 and moved.json()["starts_at"].startswith("2030-02-03")
++    window = client.get("/events", headers=w.fh, params={"from": "2030-02-02T00:00:00Z", "to": "2030-02-04T00:00:00Z"})
++    assert [e["id"] for e in window.json()] == [ev["id"]]
++    assert client.post("/events", headers=w.fh, json={
++        "subject_id": w.sid, "type": "nonsense", "title": "x",
++        "starts_at": "2030-02-01T09:00:00Z"}).status_code == 422
++    # A module from some other subject cannot be linked.
++    other = ctx.make_subject(w.fac["user_id"])
++    other_mod = ctx.make_module(other["subject_id"], 1, "Other")
++    assert client.post("/events", headers=w.fh, json={
++        "subject_id": w.sid, "type": "assignment", "title": "x", "module_id": other_mod["module_id"],
++        "starts_at": "2030-02-01T09:00:00Z"}).status_code == 404
++    assert client.delete(f"/events/{ev['id']}", headers=w.fh).json() == {"deleted": True}
++    assert client.patch(f"/events/{ev['id']}", headers=w.fh, json={"title": "gone"}).status_code == 404
++
++
++def test_another_faculty_cannot_move_or_delete_my_event(client, ctx, db):
++    w = _world(ctx, db)
++    ev = client.post("/events", headers=w.fh, json={
++        "subject_id": w.sid, "type": "quiz", "title": "Mine", "starts_at": "2030-03-01T09:00:00Z"}).json()
++    other = ctx.make_faculty()
++    oh = _tok(ctx, email=other["email"], password=other["password"])
++    assert client.patch(f"/events/{ev['id']}", headers=oh, json={"title": "hijack"}).status_code == 404
++    assert client.delete(f"/events/{ev['id']}", headers=oh).status_code == 404
++    still = client.get("/events", headers=w.fh).json()
++    assert [e["title"] for e in still] == ["Mine"]
++
++
++def test_publishing_a_quiz_creates_its_event(client, ctx, db):
++    """Aparna's publish endpoint owns this; checked here because the calendar depends on it."""
++    w = _world(ctx, db)
++    # The world quiz was published straight in SQL, so make a second one through the API.
++    now = datetime.now(timezone.utc)
++    q = client.post("/quizzes", headers=w.fh, json={
++        "module_id": w.mod["module_id"], "title": "API quiz",
++        "opens_at": (now + timedelta(days=1)).isoformat(), "closes_at": (now + timedelta(days=2)).isoformat()})
++    assert q.status_code in (200, 201), q.text
++    qid = q.json().get("id") or q.json().get("quiz_id")
++    add = client.post(f"/quizzes/{qid}/questions", headers=w.fh,
++                      json={"question_id": w.qs[0]["question_id"]})
++    assert add.status_code in (200, 201), add.text
++    pub = client.post(f"/quizzes/{qid}/publish", headers=w.fh)
++    assert pub.status_code == 200, pub.text
++    titles = [e["title"] for e in client.get("/events", headers=w.fh).json()]
++    assert any("API quiz" in t for t in titles)
++    db.execute(text("DELETE FROM quizzes WHERE id = :q"), {"q": qid})
++    db.commit()
++
++
++# ---------------------------------------------------------------------------
++# 6. Usage logging (fake AI client, no credentials)
++# ---------------------------------------------------------------------------
++
++class _FakeClient:
++    def chat(self, model, messages, temperature=0.2, max_tokens=500, **_):
++        return SimpleNamespace(content="Inorder traversal visits left, node, right [Slide 2].",
++                               usage={"prompt_tokens": 120, "completion_tokens": 30})
++
++    def close(self):
++        pass
++
++
++def test_ai_calls_are_logged_and_summed_per_step(client, ctx, db, monkeypatch, log_cleanup):
++    from backend.app.routers import study as study_router
++    from backend.app.services import ai_glue
++    monkeypatch.setenv("MODEL_REASONING", "fake-model")
++    monkeypatch.setattr(study_router, "get_client", lambda: _FakeClient())
++    monkeypatch.setattr(ai_glue, "get_client", lambda: _FakeClient())
++
++    w = _world(ctx, db)
++    _load_chunks(ctx, db, w)
++    sh = _tok(ctx, usn=w.students[0]["usn"], pin=w.students[0]["pin"])
++    before = {r["step"]: r for r in client.get("/usage/summary", headers=w.fh).json()}.get("qa", {})
++    for _ in range(2):
++        r = client.post("/qa", headers=sh, json={"subject_id": w.sid, "question": "How does inorder traversal work?"})
++        assert r.status_code == 200 and r.json()["refused"] is False
++
++    after = {r["step"]: r for r in client.get("/usage/summary", headers=w.fh).json()}["qa"]
++    assert after["calls"] - before.get("calls", 0) == 2
++    assert after["prompt_tokens"] - before.get("prompt_tokens", 0) == 240
++    assert after["completion_tokens"] - before.get("completion_tokens", 0) == 60
++    assert after["total_tokens"] - before.get("total_tokens", 0) == 300
++    row = db.execute(text("SELECT role, model, step FROM agent_logs WHERE model = 'fake-model' LIMIT 1")).fetchone()
++    assert tuple(row) == ("student", "fake-model", "qa")
++
++
++def test_a_failing_ai_call_falls_back_to_the_slides_and_is_logged(client, ctx, db, monkeypatch, log_cleanup):
++    from backend.app.routers import study as study_router
++
++    class Broken(_FakeClient):
++        def chat(self, *a, **k):
++            raise RuntimeError("provider down")
++
++    monkeypatch.setenv("MODEL_REASONING", "fake-model")
++    monkeypatch.setattr(study_router, "get_client", lambda: Broken())
++    w = _world(ctx, db)
++    _load_chunks(ctx, db, w)
++    sh = _tok(ctx, usn=w.students[0]["usn"], pin=w.students[0]["pin"])
++    r = client.post("/qa", headers=sh, json={"subject_id": w.sid, "question": "How does inorder traversal work?"})
++    assert r.status_code == 200
++    assert r.json()["refused"] is False and r.json()["citations"]
++    err = db.execute(text("SELECT error FROM agent_logs WHERE model = 'fake-model' AND error IS NOT NULL")).fetchall()
++    assert err
+diff -ruN -x __pycache__ -x node_modules -x '*.pyc' -x .pytest_cache a/tests/unit/conftest.py ./tests/unit/conftest.py
+--- a/tests/unit/conftest.py	1970-01-01 00:00:00.000000000 +0000
++++ ./tests/unit/conftest.py	2026-10-25 10:04:57.809617590 +0000
+@@ -0,0 +1,7 @@
++"""Unit tests never touch a database, but the route modules import the app config,
++which insists on these two variables. Harmless placeholders, only set if missing."""
++
++import os
++
++os.environ.setdefault("DATABASE_URL", "postgresql://unused:unused@localhost:5432/unused")
++os.environ.setdefault("SESSION_SECRET", "unit-test-secret")
+diff -ruN -x __pycache__ -x node_modules -x '*.pyc' -x .pytest_cache a/tests/unit/test_routers.py ./tests/unit/test_routers.py
+--- a/tests/unit/test_routers.py	2026-10-23 08:36:40.000000000 +0000
++++ ./tests/unit/test_routers.py	2026-10-25 10:05:17.237847460 +0000
+@@ -37,7 +37,8 @@
+         self.faculty_user = {"user_id": "fac-1", "role": "faculty", "name": "Prof. Rao"}
+         self.student_1 = {"user_id": "u-s1", "role": "student", "student_id": "stud-1", "usn": "1XX23CS001"}
+         self.student_2 = {"user_id": "u-s2", "role": "student", "student_id": "stud-2", "usn": "1XX23CS002"}
+-        self.now = datetime(2026, 10, 20, 10, 0, 0, tzinfo=timezone.utc)
++        # Relative to the real clock: a fixed date makes quiz windows expire as time passes.
++        self.now = datetime.now(timezone.utc).replace(microsecond=0) - timedelta(hours=1)
+ 
+     # --- 1. Upload Router ---
+     def test_upload_router_handlers(self):
