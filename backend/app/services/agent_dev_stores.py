@@ -71,3 +71,23 @@ def _seed_store():
     ]
     co_id_map = {f"dev-co-{c.number}": c for c in cos}
     return InMemoryAnalyticsStore(cos=cos, roster=roster, attempts=attempts, co_id_map=co_id_map)
+
+
+_dev_calendar_store: Any | None = None
+
+
+def build_dev_calendar_store(connection: Any = None) -> Any | None:
+    """Return one shared in-memory calendar store for development, or None when the flag is off.
+
+    It is shared across requests, so a confirmed event shows up in the next list call. It
+    resets when the server restarts, and it is refused in production like the analytics data.
+    """
+    global _dev_calendar_store
+    if not dev_stores_enabled():
+        return None
+    validate_dev_store_config()
+    if _dev_calendar_store is None:
+        from app.services.calendar import InMemoryCalendarStore
+
+        _dev_calendar_store = InMemoryCalendarStore()
+    return _dev_calendar_store

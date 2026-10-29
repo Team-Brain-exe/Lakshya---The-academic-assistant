@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from functools import partial
 from typing import Any
 
@@ -11,13 +11,20 @@ from ai.tool_contracts import build_tool_registry
 from sqlalchemy import text
 
 from .agent_api import build_postgres_agent_handler_factory, install_agent_handler_factory
-from .agent_dev_stores import build_dev_analytics_store, validate_dev_store_config
+from .agent_dev_stores import (
+    build_dev_analytics_store,
+    build_dev_calendar_store,
+    validate_dev_store_config,
+)
+from .agent_bindings import bind_student_self_progress
 from .agent_errors import report_app_errors
+from .agent_executors import make_schedule_executor
 
 
 def build_agent_tool_registry(
     connection: Any,
     analytics_store_factory: Callable[[Any], Any] | None = None,
+    proposal_executors_factory: Callable[[Any], Mapping[str, Any]] | None = None,
 ):
     """Bind only implemented, server-authorized tools to the shared contracts.
 
@@ -48,10 +55,12 @@ def build_agent_tool_registry(
         store = analytics_store_factory(connection)
         if store is not None:
             _bind_analytics_tools(handlers, agent_tools, store)
+            bind_student_self_progress(handlers, agent_tools, store)
 
+    executors = proposal_executors_factory(connection) if proposal_executors_factory else {}
     # Surface backend AppError messages to the model as tool results.
     handlers = {name: report_app_errors(fn) for name, fn in handlers.items()}
-    return build_tool_registry(handlers)
+    return build_tool_registry(handlers, proposal_executors=list(executors))
 
 
 def _bind_analytics_tools(handlers: dict[str, Any], agent_tools: Any, store: Any) -> None:
@@ -139,6 +148,20 @@ def tool_usage_recorder_factory(connection: Any) -> Callable[[dict[str, Any]], N
     return record
 
 
+def build_proposal_executors(connection: Any) -> dict[str, Any]:
+    """Confirmation executors for calendar proposals. Registered only when a calendar store exists.
+
+    Without a store the propose tools stay hidden from the model, so nothing can be
+    proposed that could not be confirmed.
+    """
+    from .calendar import create_event
+
+    store = build_dev_calendar_store(connection)
+    if store is None:
+        return {}
+    return {"propose_schedule_event": make_schedule_executor(store, create_event)}
+
+
 def configure_agent_runtime(app: Any, *, config: AIConfig | None = None) -> bool:
     """Install the request-scoped runtime only when required model config exists.
 
@@ -160,9 +183,11 @@ def configure_agent_runtime(app: Any, *, config: AIConfig | None = None) -> bool
         tool_registry_factory=partial(
             build_agent_tool_registry,
             analytics_store_factory=build_dev_analytics_store,
+            proposal_executors_factory=build_proposal_executors,
         ),
         usage_recorder_factory=agent_usage_recorder_factory,
         tool_usage_recorder_factory=tool_usage_recorder_factory,
+        proposal_executors_factory=build_proposal_executors,
     )
     install_agent_handler_factory(app, factory)
     app.state.agent_client = client
