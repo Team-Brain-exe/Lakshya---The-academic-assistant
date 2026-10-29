@@ -68,11 +68,16 @@ npm install
 npm run dev
 ```
 
-Seed demo data (TODO):
+Seed demo data (needs `DATABASE_URL` in `.env`; safe to run twice):
 
 ```bash
-python seed/seed.py
+python -m seed.seed --yes          # load: 1 subject, 6 COs, 4 modules, 13 slides, 10 approved questions, 60 students, 2 quizzes, 118 attempts
+python -m seed.seed --remove --yes # delete only the rows the seed created
 ```
+
+Demo logins after seeding (all invented): faculty `raman@lakshya.edu` / `Demo@12345`,
+students `1XX23CS001` to `1XX23CS060` with PIN `123456`. The seed prints the target
+database host (never the password) and asks for confirmation unless `--yes` is given.
 
 ## Backend
 
@@ -205,18 +210,34 @@ docker run -p 8000:8000 \
 
 ```bash
 pip install -r backend/requirements.txt
-pytest
+pytest tests/unit                       # no database needed
+pytest tests/backend                    # needs DATABASE_URL and SESSION_SECRET; creates and removes its own rows
+pytest tests/backend/test_arya_integration.py   # Arya's routes: permissions, upload, CO sheet, study, calendar
 ```
 
-`pytest.ini` points at `backend/` and `tests/`, so no other setup is needed.
+`pytest.ini` points at `backend/` and `tests/`. The backend tests need a database that has migrations
+001 to 003 applied (004 only matters on Supabase). AI-backed paths are tested with a fake client, so
+no Token Factory key is needed to run the suite.
 
 ## Demo data
 
 All demo data is synthetic. Student seat numbers (USNs) are fake. No real student records are in this repository.
 
+Seed it with `python -m seed.seed --yes` (see Setup). The seed inserts quizzes as drafts, links their
+approved questions, and only then publishes them, because the database refuses to publish a quiz
+that has no approved questions. It also creates the calendar events and the flashcards and notes.
+
 ## Hosted demo
 
-TODO: URL (owner: Aparna).
+Backend API: https://lakshya-the-academic-assistant.onrender.com (health check: /health, interactive docs: /docs).
+
+The backend runs on Render's free tier, so the first request after a period of inactivity can take about a minute.
+
+Demo logins (invented, demo database only):
+
+- Faculty: raman@lakshya.edu / Demo@12345
+- Student: 1XX23CS001 / 123456 (every demo student uses this PIN)
+- 1XX23CS060 is in Section B, which is weak in CO3.
 
 ## License
 

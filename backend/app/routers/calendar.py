@@ -125,5 +125,150 @@ class CalendarRouterHandler:
             return 403, format_error("FORBIDDEN", str(exc))
 
 
-router = APIRouter() if HAS_FASTAPI else None
+# ---------------------------------------------------------------------------
+# Live routes (Postgres)
+# ---------------------------------------------------------------------------
 
+from pydantic import BaseModel
+from sqlalchemy import text
+
+from ..db import get_conn
+from ..deps import get_current_user, require_faculty
+from ..errors import AppError
+from ..pg.calendar import PostgresCalendarStore
+from ..pg.common import as_uuid, enrolled_subject_ids, subject_for_faculty, subject_for_user
+from ..services.calendar import (
+    CalendarPermissionError,
+    CalendarValidationError,
+    create_event,
+    delete_event,
+    update_event,
+)
+
+router = APIRouter(tags=["calendar"])
+
+
+class EventCreate(BaseModel):
+    subject_id: str
+    type: str
+    title: str
+    starts_at: datetime
+    ends_at: datetime | None = None
+    section: str | None = None
+    quiz_id: str | None = None
+    module_id: str | None = None
+
+
+class EventPatch(BaseModel):
+    type: str | None = None
+    title: str | None = None
+    starts_at: datetime | None = None
+    ends_at: datetime | None = None
+    section: str | None = None
+    quiz_id: str | None = None
+    module_id: str | None = None
+
+
+def _translate(exc: Exception) -> AppError:
+    if isinstance(exc, CalendarPermissionError):
+        return AppError(403, "FORBIDDEN", str(exc))
+    if isinstance(exc, CalendarValidationError):
+        return AppError(422, "VALIDATION_ERROR", str(exc))
+    return AppError(404, "NOT_FOUND", "Event not found")
+
+
+def _check_links(conn, subject_id: str, quiz_id: str | None, module_id: str | None) -> None:
+    """A linked quiz or module must belong to the same subject."""
+    if quiz_id and conn.execute(
+        text("SELECT 1 FROM quizzes WHERE id = :q AND subject_id = :s"),
+        {"q": as_uuid(quiz_id, "Quiz"), "s": subject_id},
+    ).fetchone() is None:
+        raise AppError(404, "NOT_FOUND", "Quiz not found")
+    if module_id and conn.execute(
+        text("SELECT 1 FROM modules WHERE id = :m AND subject_id = :s"),
+        {"m": as_uuid(module_id, "Module"), "s": subject_id},
+    ).fetchone() is None:
+        raise AppError(404, "NOT_FOUND", "Module not found")
+
+
+def _owned_event(conn, store: PostgresCalendarStore, event_id: str, user: dict):
+    event = store.get_event(event_id)
+    if event is None:
+        raise AppError(404, "NOT_FOUND", "Event not found")
+    subject_for_faculty(conn, event.subject_id, user)  # 404 if it is another faculty member's
+    return event
+
+
+@router.post("/events", status_code=201)
+def post_event(body: EventCreate, conn=Depends(get_conn), user=Depends(require_faculty)):
+    sid = str(subject_for_faculty(conn, body.subject_id, user)["id"])
+    _check_links(conn, sid, body.quiz_id, body.module_id)
+    try:
+        event = create_event(
+            PostgresCalendarStore(conn), user, sid, body.type, body.title.strip(), body.starts_at,
+            ends_at=body.ends_at, section=body.section, quiz_id=body.quiz_id, module_id=body.module_id,
+        )
+    except (CalendarPermissionError, CalendarValidationError) as exc:
+        raise _translate(exc) from None
+    return event.to_dict()
+
+
+@router.get("/events")
+def get_events(
+    subject_id: str | None = None,
+    from_: datetime | None = Query(None, alias="from"),
+    to: datetime | None = None,
+    conn=Depends(get_conn),
+    user=Depends(get_current_user),
+):
+    if user["role"] == "faculty":
+        if subject_id:
+            allowed = [str(subject_for_faculty(conn, subject_id, user)["id"])]
+        else:
+            rows = conn.execute(
+                text("SELECT id FROM subjects WHERE faculty_user_id = :f"), {"f": user["user_id"]}
+            ).fetchall()
+            allowed = [str(r[0]) for r in rows]
+        sections: dict[str, str] = {}
+    else:
+        if subject_id:
+            allowed = [str(subject_for_user(conn, subject_id, user)["id"])]
+        else:
+            allowed = enrolled_subject_ids(conn, user["student_id"])
+        rows = conn.execute(
+            text("SELECT subject_id, section FROM enrollments WHERE student_id = :s"), {"s": user["student_id"]}
+        ).fetchall()
+        sections = {str(r[0]): r[1] for r in rows}
+
+    events = PostgresCalendarStore(conn).list_events(allowed, from_, to)
+    if user["role"] == "student":
+        # Section-specific events are only for that section.
+        events = [e for e in events if e.section is None or e.section == sections.get(e.subject_id)]
+    return [e.to_dict() for e in events]
+
+
+@router.patch("/events/{event_id}")
+def patch_event(event_id: str, body: EventPatch, conn=Depends(get_conn), user=Depends(require_faculty)):
+    store = PostgresCalendarStore(conn)
+    _owned_event(conn, store, event_id, user)
+    updates = body.model_dump(exclude_unset=True)
+    if updates.get("title") is not None:
+        updates["title"] = updates["title"].strip()
+    existing = store.get_event(event_id)
+    if "quiz_id" in updates or "module_id" in updates:
+        _check_links(conn, existing.subject_id, updates.get("quiz_id"), updates.get("module_id"))
+    try:
+        return update_event(store, user, event_id, updates).to_dict()
+    except (CalendarPermissionError, CalendarValidationError, KeyError) as exc:
+        raise _translate(exc) from None
+
+
+@router.delete("/events/{event_id}")
+def remove_event(event_id: str, conn=Depends(get_conn), user=Depends(require_faculty)):
+    store = PostgresCalendarStore(conn)
+    _owned_event(conn, store, event_id, user)
+    try:
+        delete_event(store, user, event_id)
+    except CalendarPermissionError as exc:
+        raise _translate(exc) from None
+    return {"deleted": True}

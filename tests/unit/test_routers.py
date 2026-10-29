@@ -37,7 +37,8 @@ class RouterHandlerTests(unittest.TestCase):
         self.faculty_user = {"user_id": "fac-1", "role": "faculty", "name": "Prof. Rao"}
         self.student_1 = {"user_id": "u-s1", "role": "student", "student_id": "stud-1", "usn": "1XX23CS001"}
         self.student_2 = {"user_id": "u-s2", "role": "student", "student_id": "stud-2", "usn": "1XX23CS002"}
-        self.now = datetime(2026, 10, 20, 10, 0, 0, tzinfo=timezone.utc)
+        # Relative to the real clock: a fixed date makes quiz windows expire as time passes.
+        self.now = datetime.now(timezone.utc).replace(microsecond=0) - timedelta(hours=1)
 
     # --- 1. Upload Router ---
     def test_upload_router_handlers(self):

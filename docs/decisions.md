@@ -27,6 +27,10 @@ Decision needed from Danwin today:
 
 If pgvector is chosen, Aparna adds the `vector` extension and the `embedding` column to the schema (see `requests-to-aparna.md`). Embedding dimension depends on the model, so the schema waits for the model ID.
 
+**Update (Arya, 28 Oct): built and tested as Fallback B, still waiting for Danwin to confirm.** Nobody has confirmed an embedding model on Token Factory, so slide Q&A currently loads a subject's chunks from Postgres and scores them with the keyword scorer in `services/qa.py` (common question words are ignored). It needs no extension, no extra model and no schema change, and nothing is lost when the server restarts. Retrieval is behind `PostgresChunkRetrievalStore.search_chunks`, so switching to pgvector or full-text search later changes one class. Limits: it matches words, not meaning, so a question phrased with none of the slide's words will be refused. The integration tests check that on-topic questions cite the right slide and off-topic ones are refused.
+
+- [ ] Danwin: confirm Fallback B is acceptable for the demo, or give the embedding model ID.
+
 ## 2. Which attempt counts when a student attempts twice
 
 **Status: Open, faculty decide. Default: `best`**

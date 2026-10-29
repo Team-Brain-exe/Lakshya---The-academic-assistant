@@ -26,8 +26,12 @@ services:
         sync: false
       - key: MODEL_TAGGING
         sync: false
+      - key: MODEL_AGENT
+        sync: false
       # Optional – sensible defaults
       - key: ATTEMPT_RULE
         value: best
       - key: MAX_ATTEMPTS
         value: "2"
+      - key: APP_ENV
+        value: production
