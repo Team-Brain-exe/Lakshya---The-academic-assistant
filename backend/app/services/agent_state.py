@@ -164,22 +164,42 @@ class PostgresAgentStateStore:
         return self._proposal(row) if row else None
 
     def claim(self, proposal_id: str, user_id: str, role: str) -> AgentProposal:
+        ttl_minutes = 15  # a pending proposal older than this can no longer be confirmed
+        timeout_minutes = 5  # a confirm stuck in 'processing' longer than this is failed
+        owner = {"id": proposal_id, "user_id": user_id, "role": role}
+        # A confirm that started and never finished is failed, never retried: its calendar
+        # write may already have happened.
+        self.connection.execute(
+            text(
+                "UPDATE agent_proposals SET status = 'failed', resolved_at = now() "
+                "WHERE id = :id AND user_id = :user_id AND role = :role AND status = 'processing' "
+                "AND claimed_at < now() - make_interval(mins => :timeout)"
+            ),
+            {**owner, "timeout": timeout_minutes},
+        )
         row = self.connection.execute(
             text(
-                "UPDATE agent_proposals SET status = 'processing' "
+                "UPDATE agent_proposals SET status = 'processing', claimed_at = now() "
                 "WHERE id = :id AND user_id = :user_id AND role = :role AND status = 'pending' "
+                "AND created_at > now() - make_interval(mins => :ttl) "
                 "RETURNING id, user_id, role, tool_name, arguments, status, created_at"
             ),
-            {"id": proposal_id, "user_id": user_id, "role": role},
+            {**owner, "ttl": ttl_minutes},
         ).mappings().fetchone()
         if row is not None:
             return self._proposal(row)
         existing = self.connection.execute(
-            text("SELECT user_id, role, status FROM agent_proposals WHERE id = :id"),
-            {"id": proposal_id},
+            text(
+                "SELECT user_id, role, status, "
+                "created_at < now() - make_interval(mins => :ttl) AS expired "
+                "FROM agent_proposals WHERE id = :id"
+            ),
+            {"id": proposal_id, "ttl": ttl_minutes},
         ).mappings().fetchone()
         if existing is None or str(existing["user_id"]) != user_id or existing["role"] != role:
             raise ProposalNotFoundError("Proposal not found")
+        if existing["status"] == "pending" and existing["expired"]:
+            raise ProposalConflictError("This proposal has expired. Ask for a new one.")
         raise ProposalConflictError("Proposal is no longer pending")
 
     def finish(self, proposal_id: str, status: str) -> None:
