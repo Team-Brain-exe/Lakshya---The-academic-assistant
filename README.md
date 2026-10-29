@@ -215,7 +215,15 @@ that has no approved questions. It also creates the calendar events and the flas
 
 ## Hosted demo
 
-TODO: URL (owner: Aparna).
+Backend API: https://lakshya-the-academic-assistant.onrender.com (health check: /health, interactive docs: /docs).
+
+The backend runs on Render's free tier, so the first request after a period of inactivity can take about a minute.
+
+Demo logins (invented, demo database only):
+
+- Faculty: raman@lakshya.edu / Demo@12345
+- Student: 1XX23CS001 / 123456 (every demo student uses this PIN)
+- 1XX23CS060 is in Section B, which is weak in CO3.
 
 ## License
 
