@@ -1,4 +1,4 @@
-"""Optional, environment-backed runtime bootstrap for authenticated agent routes."""
+﻿"""Optional, environment-backed runtime bootstrap for authenticated agent routes."""
 from __future__ import annotations
 
 import json
@@ -12,6 +12,7 @@ from sqlalchemy import text
 
 from .agent_api import build_postgres_agent_handler_factory, install_agent_handler_factory
 from .agent_dev_stores import build_dev_analytics_store, validate_dev_store_config
+from .agent_errors import report_app_errors
 
 
 def build_agent_tool_registry(
@@ -48,6 +49,8 @@ def build_agent_tool_registry(
         if store is not None:
             _bind_analytics_tools(handlers, agent_tools, store)
 
+    # Surface backend AppError messages to the model as tool results.
+    handlers = {name: report_app_errors(fn) for name, fn in handlers.items()}
     return build_tool_registry(handlers)
 
 
