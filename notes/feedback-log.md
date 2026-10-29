@@ -4,6 +4,10 @@ The submission asks for feedback on Nebius Token Factory, AI Cloud and any NVIDI
 
 Format: date, who, what we tried, what happened.
 
+## Evaluation status
+
+- No local `.env`, Token Factory credentials/model IDs, or PowerPoint test decks were available in this checkout. No live provider calls or model-quality claims have been made. Use `python -m ai.evaluate_models` with authorized local credentials and supplied decks, then record observed latency, JSON reliability, failures, and human-reviewed quality below.
+
 ## Token Factory
 
 - (date, name) setup and access:

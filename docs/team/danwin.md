@@ -36,76 +36,76 @@ Start with item 1 on day one. Items 2 to 4 depend on the schemas, so commit thos
 
 ### 2. CO tagging (2 points)
 
-- [ ] Build `tag_content_with_COs(chunks, cos)`, returning a list of `{chunk_id, cos, confidence}`.
-- [ ] Batch chunks to limit calls. Retry once on bad JSON. If it still fails, mark the chunk untagged. Never fail the whole upload.
-- [ ] Return token usage per call, so Arya's usage log can record it.
-- [ ] Commit the output schema to `ai/schemas/` before Arya builds the upload pipeline.
+- [x] Build `tag_content_with_COs(chunks, cos)`, returning a list of `{chunk_id, cos, confidence}`.
+- [x] Batch chunks to limit calls. Retry once on bad JSON. If it still fails, mark the chunk untagged. Never fail the whole upload.
+- [x] Return token usage per call, so Arya's usage log can record it.
+- [x] Commit the output schema to `ai/schemas/` before Arya builds the upload pipeline.
 
 ### 3. Quiz generation (2 points)
 
-- [ ] Build `generate_quiz(module, co, difficulty, count)`, returning drafts with `status=draft` and `source=AI`.
-- [ ] Validate every draft before review: 4 options, exactly 1 correct, the CO matches the request, no duplicate stems.
-- [ ] Pre-generate and approve 1 or 2 quizzes for the demo. Give the approved set to Arya for the seed data.
+- [x] Build `generate_quiz(module, co, difficulty, count)`, returning drafts with `status=draft` and `source=AI`.
+- [x] Validate every draft before review: 4 options, exactly 1 correct, the CO matches the request, no duplicate stems.
+- [ ] Pre-generate and approve 1 or 2 quizzes for the demo. Blocked until Token Factory credentials/model IDs and faculty approval are available.
 
 ### 4. Agent loop and tool schemas (3 points)
 
-- [ ] Build the tool-calling loop in FastAPI: send the conversation and tool schemas to the model, run the tool it picks, return the result, and repeat until it answers.
-- [ ] Cap the loop at about 6 steps so a confused model cannot spin forever.
-- [ ] Write the JSON schema for every agent tool. Aparna implements the CO-data tools, and Arya implements the Q&A, study plan and calendar tools. You own the contracts.
-- [ ] Write a system prompt for each role. The role decides which tools are offered. The server enforces the same check.
-- [ ] Put the grounding rule in the prompt: every figure comes from a tool result, and the agent says it does not know when retrieval finds nothing.
-- [ ] Make the faculty chain work in one message: find weak COs, generate a remedial quiz, propose a schedule.
-- [ ] Schedule and move actions return a proposal. Nothing is saved until the user confirms.
+- [x] Build the bounded tool-calling loop and FastAPI routes. `main.py` now installs the PostgreSQL runtime automatically when `.env` has HTTPS Token Factory settings plus `MODEL_AGENT` and `MODEL_GENERATION`; only faculty `generate_quiz` is bound today. Migration 005 is required. Analytics access still needs a persistent store adapter, and student Q&A/study/calendar handlers and proposal executors remain pending. Missing settings or migration returns `503 AGENT_NOT_CONFIGURED`; roles with no registered tools get a no-model unavailable reply.
+- [x] Cap the loop at 6 model steps, 6 tool calls per request, and 3 tool calls in a single model response.
+- [x] Publish JSON schemas for every agent tool in `ai/schemas/agent-tools.json`. The runtime binds Aparna's faculty quiz-draft handler; CO analytics still needs a persistent store adapter, and Arya's Q&A/study/calendar handlers remain pending.
+- [x] Write a system prompt for each role. Tools are filtered by role in the server-side registry.
+- [x] Put the grounding rule in the prompt: figures come from tool results; the agent says it does not know when retrieval finds nothing.
+- [ ] Make the faculty chain work end to end in one message: find weak COs, generate a remedial quiz, propose a schedule. Waiting on live tool adapters.
+- [x] Schedule and move actions return confirmation-gated proposals. No write handler runs until the user confirms.
 
 ### 5. Agent integration and role tests (2 points)
 
-- [ ] Register every agent tool with the loop. Check that each schema matches its implementation.
-- [ ] Write the role-scoping tests: a student who asks about another student's USN is refused, both through the API and through the agent. Report any failure to the owner of that tool.
-- [ ] Confirm that every write the agent makes needs confirmation or review first.
+- [ ] Register every agent tool with a real implementation and verify schema matches. The registry builder omits missing handlers rather than exposing stubs.
+- [x] Add agent-core and FastAPI route tests that refuse a student's attempt to pass another student's USN to `get_my_progress`, and reject role fields supplied in the request body. Test real DB tool-handler ownership once the adapters are registered.
+- [x] Mutating agent actions are either reviewable drafts or confirmation-gated proposals.
 
 ### 6. Upload and quiz integration (4 points)
 
-- [ ] Connect the upload screens to Arya's pipeline and Aparna's endpoints. Run the upload end to end with real slides, and confirm a failed tagging call does not break it.
-- [ ] Connect the review, quiz builder and attempt screens to the quiz loop. Run the end-to-end check: generate, review, approve, publish, attempt, grade, and StudentCOScore written.
-- [ ] Confirm that the backend blocks publishing an unapproved question.
+- [ ] Connect the upload screens to Arya's pipeline and Aparna's endpoints, then test with authorized real decks. Offline integration tests confirm malformed tagging JSON leaves chunks untagged without failing upload.
+- [ ] Run the complete generate, review, approve, publish, attempt, grade, and StudentCOScore flow against the hosted app.
+- [x] Confirm that the existing backend blocks publishing an unapproved question (covered by the current unit tests).
 
 ### 7. Smoke-test script (1 point)
 
-- [ ] In `tests/integration/`, write a script that logs in, sends one agent message, and exports one sheet. Run it the morning of submission.
+- [x] Add `tests/integration/smoke_test.py` to log in, send one agent message, and export one sheet.
+- [ ] Run it the morning of submission against a hosted app. It cannot run in this checkout until `SMOKE_BASE_URL`, faculty test credentials, a subject ID, and the agent runtime are configured.
 
 ### 8. App shell and login screens (1 point)
 
-- [ ] Login screens for student (USN plus PIN) and faculty. Store the session and route each user by role.
+- [x] Student USN/PIN and faculty login forms, in-memory sessions, role-specific navigation, subject selector, and logout are implemented in `frontend/`. Tokens are not persisted in browser storage, so a page refresh requires sign-in again.
 
 ### 9. Agent chat panel (2 points)
 
-- [ ] Chat panel for both roles: message list, a loading state, and chips that show which tool ran (for example, "Called find_weak_COs").
-- [ ] Confirmation card for schedule and move actions, with approve and cancel.
-- [ ] Show a generated quiz draft with a link to the review screen.
+- [x] Both roles have message history, loading/error states, tool chips, and suggested prompts.
+- [x] Schedule/move proposals show approve/cancel; proposal IDs and statuses follow the backend contract.
+- [x] Quiz draft cards link to question review. Live use still waits on registered agent tool handlers.
 
 ### 10. Study, flashcard and Q&A screens (2 points)
 
-- [ ] Study plan page, flashcards page, and a Q&A page that shows the slide citation.
+- [x] Study plan, flashcards, and slide-cited Q&A pages are implemented with loading/empty/error states. Endpoints are not all mounted in the current backend, so unavailable services are shown as errors instead of fake data.
 
 ### 11. Faculty review screen (2 points)
 
-- [ ] List generated questions by CO. Let faculty edit the text, options and correct answer, then approve or reject each one.
-- [ ] Show each question's source (AI or faculty) and its status.
-- [ ] Uses Aparna's question endpoints.
+- [x] Questions are grouped by CO and filterable by module, status, and source; faculty can edit question text/options/correct answer/explanation and approve or reject.
+- [x] Source and status chips are shown; the screen calls Aparna's question endpoints.
 
 ### 12. Calendar screens (2 points)
 
-- [ ] Month and week views for both roles, using Arya's event endpoints.
-- [ ] Upcoming deadlines on the student home screen.
+- [x] Month/week views are available for both roles; faculty can add/edit/move/delete events, students have read-only views.
+- [x] Student home shows upcoming deadlines and CO progress when the backend returns them. Calendar/progress endpoints still need to be registered in the app.
 
 ### 13. Cost page (1 point)
 
-- [ ] Tokens per step, plus the before and after table, built from Arya's usage log.
+- [x] Per-step token/call totals are displayed from the usage API when available. The before/after comparison is labeled "Not reported" until real measurements and per-module data are supplied; no savings are fabricated.
 
 ### 14. README AI section and feedback notes (1 point)
 
-- [ ] Explain where Nano, Super and Ultra are used and why.
-- [ ] Write the Token Factory and NVIDIA model feedback for the submission form.
+- [x] Explain where Nano, Super and Ultra are intended to be used and why; mark model selection as pending real evaluation.
+- [ ] Write factual Token Factory and NVIDIA model feedback after authorized live tests. The feedback log records that no provider calls were run because credentials, model IDs, and slide decks are absent.
 
 ## Submission work (outside the points)
 

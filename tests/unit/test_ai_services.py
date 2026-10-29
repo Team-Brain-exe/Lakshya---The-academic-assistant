@@ -38,7 +38,7 @@ def test_token_factory_client_sends_openai_compatible_request_and_returns_usage(
         })
 
     client = TokenFactoryClient(
-        api_key="test-key",
+        api_key="x",
         base_url="https://factory.example/v1",
         transport=httpx.MockTransport(handler),
     )
@@ -47,8 +47,16 @@ def test_token_factory_client_sends_openai_compatible_request_and_returns_usage(
     assert result.content == "hello"
     assert result.usage == {"prompt_tokens": 4, "completion_tokens": 2, "total_tokens": 6}
     assert seen["url"] == "https://factory.example/v1/chat/completions"
-    assert seen["authorization"] == "Bearer test-key"
+    assert seen["authorization"] == "Bearer x"
     assert seen["body"]["model"] == "test-model"
+
+
+def test_token_factory_rejects_https_url_with_embedded_credentials():
+    with pytest.raises(ValueError, match="HTTPS URL"):
+        TokenFactoryClient(
+            api_key="x",
+            base_url="https://user:password@factory.example/v1",
+        )
 
 
 def test_tagging_batches_chunks_and_records_usage():
@@ -162,7 +170,7 @@ def test_quiz_generation_rejects_invalid_or_mismatched_difficulty(reported_diffi
 
 def test_token_factory_client_rejects_non_object_message():
     client = TokenFactoryClient(
-        api_key="test-key",
+        api_key="x",
         base_url="https://factory.example/v1",
         transport=httpx.MockTransport(
             lambda request: httpx.Response(200, json={"choices": [{"message": "malformed"}]})
@@ -176,7 +184,7 @@ def test_token_factory_client_rejects_non_object_message():
 
 def test_token_factory_client_rejects_plaintext_http_base_url():
     with pytest.raises(ValueError, match="HTTPS"):
-        TokenFactoryClient(api_key="test-key", base_url="http://factory.example/v1")
+        TokenFactoryClient(api_key="x", base_url="http://factory.example/v1")
 
 
 def test_quiz_schema_matches_runtime_marks_and_option_validation():

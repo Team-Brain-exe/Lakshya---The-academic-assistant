@@ -210,12 +210,22 @@ Errors to implement: third attempt returns `ATTEMPT_LIMIT_REACHED`; before openi
 
 | Method and path | Role | Request | Response | Status |
 |---|---|---|---|---|
-| `POST /agent/chat` | both | `{"message": "...", "conversation_id"?}` | `{conversation_id, reply, tool_calls: [{name, status}], proposals: [...], drafts: [...]}` (full shape **TBC** by Danwin) | planned |
-| `POST /agent/confirm` | both | `{"proposal_id", "approve": true\|false}` | `{status, event?}` | planned |
+| `POST /agent/chat` | both | `{"message": "...", "conversation_id"?}` | `{conversation_id, reply, tool_calls: [{name, status}], proposals: [...], drafts: [...]}` | scaffolded (requires runtime/tool adapters) |
+| `POST /agent/confirm` | both | `{"proposal_id": "...", "approve": true\|false}` | `{proposal_id, status, result?}` | scaffolded (requires proposal executors) |
 
-- `proposals` holds schedule and move actions that are not saved until `/agent/confirm` is called with `approve: true`.
-- `drafts` holds generated quizzes with a `review_url` to the faculty review screen.
-- The user and role come from the token. Tool arguments cannot choose another student's USN.
+- Conversations are stored in `agent_conversations` and scoped by authenticated user and role. A caller cannot read another user's conversation.
+- `proposals` holds schedule and move actions that are not saved until `/agent/confirm` is called with `approve: true`. Confirmation handlers claim a pending proposal once; duplicate confirmations are rejected.
+- `drafts` holds generated quiz questions for the faculty review screen; they are not published by the agent.
+- The user and role come from the token. Tool arguments cannot choose another student's identity. Students receive `get_my_progress` without a USN argument; faculty use `get_student_progress` subject to ownership checks.
+- Tools are read from `ai/schemas/agent-tools.json`; only tools with registered server handlers are offered. `main.py` installs the optional runtime at startup when the HTTPS Token Factory URL/key plus `MODEL_AGENT` and `MODEL_GENERATION` are configured. Currently only faculty `generate_quiz` is bound; missing analytics/Q&A/study/calendar handlers and proposal executors stay hidden. Missing config or migration 005 yields `503 AGENT_NOT_CONFIGURED`; a role with no available tools receives an honest unavailable response without a model call.
+- Agent iterations are capped at six model calls, six tool calls per request, and three tool calls per model response. Every numerical claim must be grounded in a tool result; if retrieval finds nothing, the agent says it does not know.
+
+### Agent tool contracts
+
+The shared tool manifest includes CO attainment, weak COs, student/faculty progress, sheet export, quiz drafts, slide-grounded Q&A, study-plan suggestions, study materials, event listing, and confirmation-gated schedule/move proposals. Tool handlers for these contracts are owned by Aparna and Arya as described in the team plans; absent handlers are omitted rather than exposed as stubs.
+
+Each tool uses an object JSON Schema with `additionalProperties: false`. The API server validates the model's arguments again before dispatching them. Mutating tools must either be reviewable drafts or confirmation-only proposals.
+
 
 ### Agent tools owned by Aparna
 
@@ -223,11 +233,12 @@ Implemented as backend functions, called by the agent loop with the session user
 
 | Tool | Role | Notes | Status |
 |---|---|---|---|
-| `get_co_attainment(subject_id, section?)` | faculty | Wraps `co-summary` | planned |
-| `find_weak_COs(subject_id, section?)` | faculty | Wraps `weak-cos` | planned |
-| `get_student_progress(usn?)` | both | A student's `usn` argument is ignored and replaced by their own | planned |
-| `export_sheet(subject_id, scope?, module_id?)` | faculty | Wraps the export endpoint, returns a download link | planned |
-| `generate_quiz(module_id, co_id, difficulty, count)` | faculty | Calls Danwin's generation function, then `POST /questions/batch` as drafts | planned |
+| `get_co_attainment(subject_id, section?)` | faculty | Wraps `co-summary` | contract published; handler pending |
+| `find_weak_COs(subject_id, section?)` | faculty | Wraps `weak-cos` | contract published; handler pending |
+| `get_my_progress(subject_id)` | student | Identity is injected from the session; no USN parameter | contract published; handler pending |
+| `get_student_progress(subject_id, usn?)` | faculty | Faculty ownership and subject access must be enforced | contract published; handler pending |
+| `export_sheet(subject_id, scope?, module_id?, section?)` | faculty | Wraps the export endpoint, returns a download link | contract published; handler pending |
+| `generate_quiz(module_id, co_id, difficulty, count)` | faculty | Calls Danwin's generation function and stores review-only drafts through `POST /questions/batch` | contract published; handler pending |
 
 Every tool validates its arguments against the JSON schemas in `ai/schemas/` before running.
 
@@ -246,5 +257,5 @@ Every tool validates its arguments against the JSON schemas in `ai/schemas/` bef
 ## Open items
 
 - Arya: confirm the shapes marked TBC (drilldown, study plan).
-- Danwin: confirm the `/agent/*` shapes and publish the tool schemas to `ai/schemas/`.
+- Danwin: agent route and contracts are scaffolded; install the runtime after tool handlers and Token Factory config are available.
 - Faculty: which attempt counts (default `best`), the real threshold and target values, and the university's sheet format.

@@ -113,8 +113,8 @@ class RouterHandlerTests(unittest.TestCase):
         self.assertTrue(body["published"])
         self.assertIsNotNone(body["event_id"])
 
-        # Student starts attempt -> questions are masked
-        status, att_body = handler.start_attempt(self.student_1, quiz_id)
+        # Student starts attempt at the same fixed clock time as the quiz window.
+        status, att_body = handler.start_attempt(self.student_1, quiz_id, now=self.now)
         self.assertEqual(status, 201)
         att_id = att_body["attempt_id"]
         self.assertNotIn("correct_option", att_body["questions"][0])
