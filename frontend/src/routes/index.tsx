@@ -1,3 +1,5 @@
+import { ApiError, auth, type LoginCredentials } from "@/lib/api";
+import { useAuth } from "@/lib/auth-context";
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
 import { BookOpen, GraduationCap, Paperclip, Star } from "lucide-react";
 import { useState } from "react";
@@ -22,16 +24,39 @@ function Login() {
   const [id, setId] = useState("");
   const [pw, setPw] = useState("");
   const [err, setErr] = useState<{ id?: string; pw?: string }>({});
+  const [serverError, setServerError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
 
-  const submit = (e: React.FormEvent) => {
+  const submit = async (e: React.FormEvent) => {
     e.preventDefault();
+    setServerError(null);
     const n: typeof err = {};
-    if (tab === "student" && !/^1[A-Z]{2}\d{2}[A-Z]{2}\d{3}$/i.test(id)) n.id = "Enter a valid USN, e.g. 1RV22CS018";
+    if (tab === "student" && !/^1[A-Z]{2}\d{2}[A-Z]{2}\d{3}$/i.test(id))
+      n.id = "Enter a valid USN, e.g. 1RV22CS018";
     if (tab === "faculty" && id.length < 3) n.id = "Enter your email or username";
     if (tab === "student" && !/^\d{4,6}$/.test(pw)) n.pw = "PIN must be 4–6 digits";
     if (tab === "faculty" && pw.length < 6) n.pw = "Password must be at least 6 characters";
     setErr(n);
-    if (!Object.keys(n).length) nav({ to: tab === "student" ? "/student/home" : "/faculty/dashboard" });
+    if (Object.keys(n).length) return;
+
+    const credentials: LoginCredentials =
+      tab === "student" ? { usn: id, pin: pw } : { email: id, password: pw };
+
+    setLoading(true);
+    try {
+      const result = await auth.login(credentials);
+      // Persist token + resolve the full user profile, then navigate.
+      await useAuth().login(result);
+      await nav({ to: result.role === "student" ? "/student/home" : "/faculty/dashboard" });
+    } catch (e) {
+      if (e instanceof ApiError) {
+        setServerError(e.message);
+      } else {
+        setServerError("Something went wrong. Please try again.");
+      }
+    } finally {
+      setLoading(false);
+    }
   };
 
   return (
@@ -39,16 +64,25 @@ function Login() {
       <div className="stripes-wine relative overflow-hidden p-10">
         <div className="paper-wine relative flex h-full flex-col justify-between p-12">
           <div className="flex items-center gap-3">
-            <span className="grid size-11 place-items-center rounded-full border border-beige/50"><Star className="size-5 fill-beige text-beige" /></span>
-            <span className="font-serif text-3xl font-bold tracking-[0.2em] text-ivory">LAKSHYA</span>
+            <span className="grid size-11 place-items-center rounded-full border border-beige/50">
+              <Star className="size-5 fill-beige text-beige" />
+            </span>
+            <span className="font-serif text-3xl font-bold tracking-[0.2em] text-ivory">
+              LAKSHYA
+            </span>
           </div>
           <div>
             <div className="eyebrow !text-beige/70">Vol. 05 — The Academic Assistant</div>
-            <h1 className="display mt-4 text-6xl !text-ivory xl:text-7xl">Your academic journey, <em className="font-medium text-beige">thoughtfully</em> organised.</h1>
+            <h1 className="display mt-4 text-6xl !text-ivory xl:text-7xl">
+              Your academic journey, <em className="font-medium text-beige">thoughtfully</em>{" "}
+              organised.
+            </h1>
           </div>
           <div className="flex items-end gap-4">
             <div className="stamp rotate-[-6deg] bg-beige p-3 text-wine">
-              <div className="grid size-20 place-items-center border border-wine/40"><GraduationCap className="size-9" strokeWidth={1.3} /></div>
+              <div className="grid size-20 place-items-center border border-wine/40">
+                <GraduationCap className="size-9" strokeWidth={1.3} />
+              </div>
             </div>
             <div className="relative rotate-[3deg] rounded-xl bg-ivory p-4 text-espresso shadow-[var(--shadow-lift)]">
               <Paperclip className="absolute -top-3 left-4 size-6 text-oxblood" />
@@ -56,7 +90,9 @@ function Login() {
               <div className="font-serif text-lg text-wine">Quiz 3 opens Friday</div>
             </div>
             <div className="stamp rotate-[8deg] bg-dusty p-3 text-oxblood">
-              <div className="grid size-16 place-items-center border border-oxblood/40"><BookOpen className="size-7" strokeWidth={1.3} /></div>
+              <div className="grid size-16 place-items-center border border-oxblood/40">
+                <BookOpen className="size-7" strokeWidth={1.3} />
+              </div>
             </div>
           </div>
         </div>
@@ -68,19 +104,57 @@ function Login() {
           <h2 className="display mt-2 text-4xl">Sign in to continue</h2>
           <div className="mt-6 grid grid-cols-2 rounded-full bg-beige p-1">
             {(["student", "faculty"] as const).map((t) => (
-              <button type="button" key={t} onClick={() => { setTab(t); setErr({}); }} className={cn("rounded-full py-2 text-sm capitalize transition", tab === t ? "bg-wine text-ivory" : "text-wine")}>{t}</button>
+              <button
+                type="button"
+                key={t}
+                onClick={() => {
+                  setTab(t);
+                  setErr({});
+                  setServerError(null);
+                }}
+                className={cn(
+                  "rounded-full py-2 text-sm capitalize transition",
+                  tab === t ? "bg-wine text-ivory" : "text-wine",
+                )}
+              >
+                {t}
+              </button>
             ))}
           </div>
           <div className="mt-6 space-y-4">
             <Field label={tab === "student" ? "USN" : "Email or username"} error={err.id}>
-              <input value={id} onChange={(e) => setId(e.target.value)} placeholder={tab === "student" ? "1RV22CS018" : "meera.rao@college.edu"} className={cn(inputCls, tab === "student" && "font-mono uppercase", err.id && "border-wine bg-wine/5")} />
+              <input
+                value={id}
+                onChange={(e) => setId(e.target.value)}
+                placeholder={tab === "student" ? "1RV22CS018" : "meera.rao@college.edu"}
+                className={cn(
+                  inputCls,
+                  tab === "student" && "font-mono uppercase",
+                  err.id && "border-wine bg-wine/5",
+                )}
+              />
             </Field>
             <Field label={tab === "student" ? "PIN" : "Password"} error={err.pw}>
-              <input type="password" value={pw} onChange={(e) => setPw(e.target.value)} placeholder="••••••" className={cn(inputCls, err.pw && "border-wine bg-wine/5")} />
+              <input
+                type="password"
+                value={pw}
+                onChange={(e) => setPw(e.target.value)}
+                placeholder="••••••"
+                className={cn(inputCls, err.pw && "border-wine bg-wine/5")}
+              />
             </Field>
           </div>
-          <Btn size="lg" className="mt-8 w-full">Login</Btn>
-          <p className="mt-6 text-center font-mono text-[10px] text-muted-foreground">© 2026 LAKSHYA · Need help? Contact your department office</p>
+          {serverError && (
+            <div className="mt-2 rounded-full bg-oxblood/10 px-4 py-2 text-sm text-oxblood">
+              {serverError}
+            </div>
+          )}
+          <Btn size="lg" className="mt-8 w-full" disabled={loading}>
+            {loading ? "Signing in…" : "Login"}
+          </Btn>
+          <p className="mt-6 text-center font-mono text-[10px] text-muted-foreground">
+            © 2026 LAKSHYA · Need help? Contact your department office
+          </p>
         </form>
       </div>
     </div>
