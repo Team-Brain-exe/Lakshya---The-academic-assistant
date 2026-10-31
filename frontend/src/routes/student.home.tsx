@@ -36,13 +36,13 @@ export const Route = createFileRoute("/student/home")({
   component: Page,
 });
 
-const QUICK_LINKS: Array<[string, ElementType, string]> = [
-  ["Quizzes", ClipboardCheck, "/student/quiz"],
-  ["My Progress", TrendingUp, "/student/home"],
-  ["Study Plan", NotebookPen, "/student/study-plan"],
-  ["Flashcards", Layers, "/student/flashcards"],
-  ["Ask the Course", MessageCircle, "/student/qa"],
-  ["Calendar", CalendarDays, "/student/calendar"],
+const QUICK_LINKS: Array<[string, ElementType, string, boolean]> = [
+  ["Quizzes", ClipboardCheck, "/student/quiz", false],
+  ["My Progress", TrendingUp, "/student/home", false],
+  ["Study Plan", NotebookPen, "/student/study-plan", true],
+  ["Flashcards", Layers, "/student/flashcards", true],
+  ["Ask the Course", MessageCircle, "/student/qa", true],
+  ["Calendar", CalendarDays, "/student/calendar", true],
 ];
 
 function Page() {
@@ -251,17 +251,29 @@ function Page() {
 
         {/* ── Quick links ── */}
         <div className="col-span-7 grid grid-cols-3 gap-4">
-          {QUICK_LINKS.map(([t, I, to], i) => (
-            <Link
-              key={t}
-              to={to}
-              className={`${i % 3 === 1 ? "bg-dusty" : "bg-ivory"} stamp flex flex-col justify-between p-5 transition hover:-translate-y-0.5`}
-              style={{ minHeight: 120 }}
-            >
-              <I className="size-6 text-wine" strokeWidth={1.4} />
-              <span className="font-serif text-xl font-semibold text-wine">{t}</span>
-            </Link>
-          ))}
+          {QUICK_LINKS.map(([t, I, to, disabled], i) =>
+            disabled ? (
+              <div
+                key={t}
+                className={`${i % 3 === 1 ? "bg-dusty" : "bg-ivory"} stamp flex flex-col justify-between p-5 opacity-50`}
+                style={{ minHeight: 120 }}
+              >
+                <I className="size-6 text-wine" strokeWidth={1.4} />
+                <span className="font-serif text-xl font-semibold text-wine">{t}</span>
+                <span className="font-mono text-[10px] text-muted-foreground">Coming soon</span>
+              </div>
+            ) : (
+              <Link
+                key={t}
+                to={to}
+                className={`${i % 3 === 1 ? "bg-dusty" : "bg-ivory"} stamp flex flex-col justify-between p-5 transition hover:-translate-y-0.5`}
+                style={{ minHeight: 120 }}
+              >
+                <I className="size-6 text-wine" strokeWidth={1.4} />
+                <span className="font-serif text-xl font-semibold text-wine">{t}</span>
+              </Link>
+            ),
+          )}
         </div>
 
         {/* ── Upcoming ── */}

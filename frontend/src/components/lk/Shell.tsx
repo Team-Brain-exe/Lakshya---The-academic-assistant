@@ -68,6 +68,8 @@ export function Shell({
   subjectLabel?: string | undefined;
   moduleLabel?: string | undefined;
 }) {
+  const [assistantOpen, setAssistantOpen] = useState(false);
+
   const path = useRouterState({ select: (s) => s.location.pathname });
   const router = useRouter();
   const { user, isAuthenticated, loading, logout } = useAuth();
@@ -88,7 +90,6 @@ export function Shell({
     );
   }
 
-  const [assistantOpen, setAssistantOpen] = useState(false);
 
   const displayName = user?.name ?? "";
   const idLabel =

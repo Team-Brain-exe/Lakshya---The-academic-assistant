@@ -19,6 +19,7 @@ export const Route = createFileRoute("/")({
 });
 
 function Login() {
+  const { login: completeLogin } = useAuth();
   const nav = useNavigate();
   const [tab, setTab] = useState<"student" | "faculty">("student");
   const [id, setId] = useState("");
@@ -46,7 +47,7 @@ function Login() {
     try {
       const result = await auth.login(credentials);
       // Persist token + resolve the full user profile, then navigate.
-      await useAuth().login(result);
+      await completeLogin(result);
       await nav({ to: result.role === "student" ? "/student/home" : "/faculty/dashboard" });
     } catch (e) {
       if (e instanceof ApiError) {

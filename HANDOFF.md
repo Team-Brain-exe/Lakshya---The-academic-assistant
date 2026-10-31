@@ -9,69 +9,46 @@
 - Frontend env var: `VITE_API_URL=https://lakshya-the-academic-assistant.onrender.com`
 - See `frontend/.env.example`
 
+## Backend CORS (required Render setting)
+- `backend/app/main.py` already parses `FRONTEND_ORIGIN` as comma-separated:
+  `allow_origins=[o.strip() for o in FRONTEND_ORIGIN.split(",") if o.strip()]`
+- Required Render environment variable: `FRONTEND_ORIGIN=https://lakshya-the-academic-assistant.onrender.com`
+- For local dev, set: `FRONTEND_ORIGIN=http://localhost:3000`
+- For both: `FRONTEND_ORIGIN=https://lakshya-the-academic-assistant.onrender.com,http://localhost:3000`
+- No other backend logic was changed.
+
+## Submission Flow Verification
+1. Login — POST /auth/login with {usn, pin} or {email, password}. Verified in index.tsx. Token stored in memory + sessionStorage.
+2. Profile — GET /auth/me called by useAuth().login() via refetch().
+3. Role redirect — index.tsx navigates to /student/home or /faculty/dashboard.
+4. Route protection — Shell bounces unauthenticated users to /.
+5. Subjects — GET /subjects via subjects.list(). Persisted via sessionStorage.
+6. Quiz list — GET /quizzes?subject_id={id} filtered by subject.
+7. Start attempt — POST /quizzes/{id}/attempts. Backend returns {attempt_id, attempt_number, attempts_left, questions}. Verified.
+8. Resume — GET /attempts/{id}. Attempt ID persisted in sessionStorage.
+9. Save answers — PUT /attempts/{id}/answers with {answers}. Backend reads payload.get("answers"). Verified.
+10. Submit — POST /attempts/{id}/submit with {answers}. Backend reads payload.get("answers"). Verified. Anti-duplicate via submitting state + session clear.
+11. Review — GET /attempts/{id}/review. Wired to "Review answers" button.
+
 ## Completed Features
+- API client (src/lib/api.ts), auth context (src/lib/auth-context.tsx), subject persistence (src/lib/subject-context.ts)
+- Login on / (src/routes/index.tsx) with real POST /auth/login + GET /auth/me, role-based redirect, Shell guard to /
+- Shell (src/components/lk/Shell.tsx): auth, route protection, logout, assistant panel, disabled "Coming soon" nav items for nonexistent student routes
+- Student Home: subject-filtered quizzes/events, real empty states, coming-soon quick links
+- Student Quiz: subject filtering, attempt start/resume via sessionStorage, answer auto-save, submit, review, anti-duplicate guards, retry when attempts remain
+- Faculty Dashboard, Upload, Review, Quiz Builder, Analytics — all connected to real backend
 
-### 1. API Client & Authentication (`src/lib/api.ts`)
-- Full typed API client covering all backend endpoints
-- Reads `VITE_API_URL` from env, defaults to Render URL
-- Supports JSON requests and multipart FormData uploads
-- Error parsing from `{"error":{"code":"...","message":"..."}}`
-- Token stored in memory + sessionStorage; `Authorization: Bearer` header on requests
-- 401 auto-clears session and redirects to `/login`
-- No backend secrets in frontend env
-
-### 2. Auth Context (`src/lib/auth-context.tsx`)
-- `AuthProvider` wrapping the app with login/logout/refetch
-- `RequireAuth` guard for protected routes
-- SSR-safe `sessionStorage` access via `typeof` guards
-- Logout clears token + cached user data
-
-### 3. Login & Workspace (`src/routes/index.tsx`, `src/routes/__root.tsx`)
-- Login persists token via `useAuth().login()`
-- Redirects by role: student → `/student/home`, faculty → `/faculty/dashboard`
-- Session restored on refresh
-- Subjects loaded via `GET /subjects`
-- Subject selector persisted in `sessionStorage` (`src/lib/subject-context.ts`)
-
-### 4. Shell (`src/components/lk/Shell.tsx`)
-- Auth integration, route protection, real logout
-- `subjectLabel` prop on both student and faculty shells
-- Functional assistant panel with proposal review
-
-### 5. Faculty Routes (all connected)
-- **Dashboard** — `GET /subjects/{id}`, `/co-summary`, `/weak-cos`, `/quizzes`, `/events`
-- **Upload** — `POST /subjects`, `PUT /cos`, `POST /modules`, `POST /modules/{id}/upload` (FormData), `GET /modules/{id}/status` (polling), `/coverage`; roster preview + confirm flow
-- **Review** — `GET /questions?module_id=`, `POST /questions`, `PATCH /questions/{id}`
-- **Quiz Builder** — `POST /quizzes`, `POST /quizzes/{id}/publish`; time validation (`closes_at` after `opens_at`); "Save as draft" before publish
-- **Analytics** — CO scores with null-safe rendering ("—" for null)
-
-### 6. Student Routes (connected)
-- **Student Home** — `GET /students/me/progress`, `/quizzes?subject_id=`, `/events`; quizzes filtered by subject; real empty states
-- **Student Quiz** — `GET /quizzes?subject_id=`; attempt start/state/resume via `sessionStorage`; answer auto-save; `POST /attempts/{id}/submit`; `POST /attempts/{id}/review`; anti-duplicate guards on start/submit; retry button only when attempts remain
-
-## Unfinished Features (left as-is per scope constraint)
-- `/login` standalone route (`src/routes/login.tsx`) — exists but not fully wired into auth flow (login is handled on `src/routes/index.tsx`)
-- `student.learning` route — not created (referenced in original checklist but not started)
-- `student.study-plan`, `student.flashcards`, `student.qa`, `student.calendar` quick links — not created (only `/student/home` and `/student/quiz` exist)
-- No new tests added (existing test at `src/test/app-routing.test.tsx` untouched)
-- Backend CORS (`backend/app/main.py`) — `main.py` was modified (see git diff) but should be verified in production
+## Unfinished (left as-is)
+- /login standalone route — exists but login is on /
+- student.study-plan, student.flashcards, student.qa, student.calendar — do not exist, shown as "Coming soon"
+- student.learning — does not exist
+- No new tests
 
 ## Files Modified
-- `frontend/src/lib/api.ts` (new)
-- `frontend/src/lib/auth-context.tsx` (new)
-- `frontend/src/lib/subject-context.ts` (new)
-- `frontend/src/components/lk/Shell.tsx` (rewritten)
-- `frontend/src/components/lk/ui.tsx` (minor tweaks)
-- `frontend/src/routes/index.tsx` (login + auth)
-- `frontend/src/routes/__root.tsx` (AuthProvider wrapper)
-- `frontend/src/routes/student.home.tsx` (subject filtering, Shell subjectLabel, quick links)
-- `frontend/src/routes/student.quiz.tsx` (subject filtering, attempt persistence, review, anti-duplicate)
-- `frontend/src/routes/faculty.dashboard.tsx`
-- `frontend/src/routes/faculty.upload.tsx`
-- `frontend/src/routes/faculty.review.tsx`
-- `frontend/src/routes/faculty.quiz-builder.tsx`
-- `frontend/src/routes/faculty.analytics.tsx`
-- `frontend/src/routeTree.gen.ts` (auto-updated)
-- `frontend/.env.example` (new)
-- `frontend/src/vite-env.d.ts` (new)
-- `backend/app/main.py` (CORS, see git diff)
+- frontend/src/lib/api.ts, auth-context.tsx, subject-context.ts (new)
+- frontend/src/components/lk/Shell.tsx (rewritten)
+- frontend/src/routes/index.tsx, student.home.tsx, student.quiz.tsx (updated)
+- frontend/src/routes/faculty.{dashboard,upload,review,quiz-builder,analytics}.tsx (updated)
+- frontend/src/routeTree.gen.ts (auto-updated)
+- frontend/.env.example, frontend/src/vite-env.d.ts (new)
+- backend/app/main.py (CORS unchanged — already comma-separated)
