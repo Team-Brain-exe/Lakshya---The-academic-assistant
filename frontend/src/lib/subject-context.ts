@@ -24,3 +24,10 @@ export function clearStoredSubjectId(): void {
     sessionStorage.removeItem(SUBJECT_STORAGE_KEY);
   }
 }
+
+/** Clear the saved active quiz attempt so logout starts fresh. */
+export function clearSavedAttempt(): void {
+  if (typeof sessionStorage !== "undefined") {
+    sessionStorage.removeItem("lakshya_active_attempt");
+  }
+}

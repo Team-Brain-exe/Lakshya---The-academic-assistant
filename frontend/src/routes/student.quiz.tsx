@@ -1,4 +1,4 @@
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { createFileRoute } from "@tanstack/react-router";
 import { formatDistanceToNow } from "date-fns";
 import { Check, Clock, RotateCcw } from "lucide-react";
@@ -13,7 +13,6 @@ import {
   type AttemptStart,
   type SubmitResult,
   type ReviewItem,
-  type AttemptState,
 } from "@/lib/api";
 import { getStoredSubjectId } from "@/lib/subject-context";
 import { cn } from "@/lib/utils";
@@ -24,9 +23,9 @@ const ATTEMPT_STORAGE_KEY = "lakshya_active_attempt";
 export const Route = createFileRoute("/student/quiz")({
   head: () => ({
     meta: [
-      { title: "Quiz Attempt · LAKSHYA" },
-      { name: "description", content: "Attempt your quiz and view your course outcome results." },
-      { property: "og:title", content: "Quiz Attempt · LAKSHYA" },
+      { title: "Quiz · LAKSHYA" },
+      { name: "description", content: "Attempt your quiz and check your course outcome results." },
+      { property: "og:title", content: "Quiz · LAKSHYA" },
       {
         property: "og:description",
         content: "Take your quiz and check your course outcome results.",
@@ -41,6 +40,7 @@ function Page() {
   const [attempt, setAttempt] = useState<AttemptStart | null>(null);
   const [answers, setAnswers] = useState<Record<string, number>>({});
   const [saved, setSaved] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
   const [confirm, setConfirm] = useState(false);
   const [done, setDone] = useState(false);
   const [result, setResult] = useState<SubmitResult | null>(null);
@@ -79,13 +79,11 @@ function Page() {
       q.opens_at &&
       new Date(q.opens_at) <= now &&
       q.closes_at &&
-      new Date(q.closes_at) >= now &&
-      (q.attempts_left ?? 0) > 0,
+      new Date(q.closes_at) >= now,
   );
 
-  // ── Attempt lifecycle: start, resume, persist ─────────────────────
+  // ── Attempt recovery: resume a saved attempt on mount ─────────────
   useEffect(() => {
-    // On mount, try to resume a saved attempt from sessionStorage.
     if (typeof sessionStorage !== "undefined") {
       const savedId = sessionStorage.getItem(ATTEMPT_STORAGE_KEY);
       if (savedId) {
@@ -94,14 +92,19 @@ function Page() {
           .getState(savedId)
           .then((state) => {
             if (state.status === "in_progress") {
-              setAttempt(state);
+              setAttempt({
+                attempt_id: state.attempt_id,
+                attempt_number: state.attempt_number,
+                attempts_left: state.attempts_left,
+                questions: state.questions,
+              });
               setAnswers(state.answers ?? {});
             } else {
+              // Attempt was already submitted — clear and show quiz list.
               sessionStorage.removeItem(ATTEMPT_STORAGE_KEY);
             }
           })
           .catch(() => {
-            // Token may have expired — the apiRequest redirect handles it.
             sessionStorage.removeItem(ATTEMPT_STORAGE_KEY);
           })
           .finally(() => setStarting(false));
@@ -109,32 +112,28 @@ function Page() {
     }
   }, []);
 
-  // Auto-start an attempt for the currently open quiz.
-  useEffect(() => {
-    if (openQuiz && !attempt && !starting) {
-      setStarting(true);
-      attempts
-        .start(openQuiz.id)
-        .then((started) => {
-          const state: AttemptState = {
-            ...started,
-            quiz_id: openQuiz.id,
-            status: "in_progress",
-            answers: {},
-            closes_at: openQuiz.closes_at ?? null,
-          };
-          setAttempt(state);
-          if (typeof sessionStorage !== "undefined") {
-            sessionStorage.setItem(ATTEMPT_STORAGE_KEY, state.attempt_id);
-          }
-        })
-        .catch((e: unknown) => {
-          if (e instanceof ApiError) setError(e.message);
-          else setError("Failed to start quiz.");
-        })
-        .finally(() => setStarting(false));
-    }
-  }, [openQuiz, attempt, starting]);
+  // ── Explicit attempt start (NOT automatic on page open) ──────────
+  const startAttempt = (quizId: string) => {
+    if (starting || attempt) return;
+    setStarting(true);
+    setError(null);
+    attempts
+      .start(quizId)
+      .then((started) => {
+        setAttempt(started);
+        setAnswers({});
+        setCurrentQuestion(0);
+        if (typeof sessionStorage !== "undefined") {
+          sessionStorage.setItem(ATTEMPT_STORAGE_KEY, started.attempt_id);
+        }
+        void queryClient.invalidateQueries({ queryKey: ["quizzes"] });
+      })
+      .catch((e: unknown) => {
+        if (e instanceof ApiError) setError(e.message);
+        else setError("Failed to start quiz.");
+      })
+      .finally(() => setStarting(false));
+  };
 
   // Persist answers to sessionStorage whenever they change.
   useEffect(() => {
@@ -146,19 +145,56 @@ function Page() {
     }
   }, [answers, attempt]);
 
-  // Auto-save answers to the backend with a visible state.
-  const saveAnswers = (newAnswers: Record<string, number>) => {
-    if (!attempt) return;
-    setAnswers(newAnswers);
-    setSaved(true);
-    setTimeout(() => setSaved(false), 1200);
-    void attempts.saveAnswers(attempt.attempt_id, newAnswers).catch(() => {});
+  // ── Answer saving (debounced, server-confirmed "Saved") ─────────
+  const [lastSaveTime, setLastSaveTime] = useState(0);
+  const [saveQueue, setSaveQueue] = useState<Record<string, number> | null>(null);
+
+  const flushSave = async (answersToSave: Record<string, number>) => {
+    if (!attempt) return false;
+    try {
+      const res = await attempts.saveAnswers(attempt.attempt_id, answersToSave);
+      return res.saved;
+    } catch (e) {
+      if (e instanceof ApiError) setSaveError(e.message);
+      else setSaveError("Could not save progress.");
+      return false;
+    }
   };
 
+  const pick = (k: number) => {
+    if (!attempt) return;
+    const qid = attempt.questions[currentQuestion]!.id;
+    const newAnswers = { ...answers, [qid]: k };
+    setAnswers(newAnswers);
+    setSaveError(null);
+
+    const now = Date.now();
+    if (now - lastSaveTime < 300) {
+      // Debounce — coalesce rapid picks, only send the latest.
+      setSaveQueue(newAnswers);
+      return;
+    }
+
+    setLastSaveTime(now);
+    void flushSave(newAnswers).then((ok) => {
+      if (ok) {
+        setSaved(true);
+        setTimeout(() => setSaved(false), 1200);
+        // If a queued save accumulated during this save, flush it.
+        if (saveQueue) {
+          setSaveQueue(null);
+          void flushSave(saveQueue);
+        }
+      }
+    });
+  };
+
+  // ── Submit (uses attempt.attempt_id, not openQuiz) ───────────────
   const handleSubmit = () => {
-    if (submitting || !attempt || !openQuiz) return;
+    if (submitting || !attempt) return;
     setSubmitting(true);
     setConfirm(false);
+    setError(null);
     attempts
       .submit(attempt.attempt_id, answers)
       .then(setResult)
@@ -168,18 +204,13 @@ function Page() {
           sessionStorage.removeItem(ATTEMPT_STORAGE_KEY);
           sessionStorage.removeItem(`lakshya_answers_${attempt.attempt_id}`);
         }
+        void queryClient.invalidateQueries({ queryKey: ["quizzes"] });
       })
       .catch((e: unknown) => {
         if (e instanceof ApiError) setError(e.message);
         else setError("Failed to submit quiz.");
       })
       .finally(() => setSubmitting(false));
-  };
-
-  const pick = (k: number) => {
-    if (!attempt) return;
-    const qid = attempt.questions[currentQuestion]!.id;
-    saveAnswers({ ...answers, [qid]: k });
   };
 
   const handleReview = () => {
@@ -199,21 +230,29 @@ function Page() {
     setAnswers({});
     setCurrentQuestion(0);
     setAttempt(null);
+    setSaved(false);
+    setSaveError(null);
+    setError(null);
     if (typeof sessionStorage !== "undefined") {
       sessionStorage.removeItem(ATTEMPT_STORAGE_KEY);
     }
   };
 
+  // ── Error state ─────────────────────────────────────────────────
   if (error) {
     return (
       <Shell role="student" subjectLabel={subjectLabel}>
         <div className="py-12 text-center">
           <div className="text-wine">{error}</div>
+          <Btn variant="secondary" className="mt-4" onClick={() => setError(null)}>
+            Dismiss
+          </Btn>
         </div>
       </Shell>
     );
   }
 
+  // ── No subjects ─────────────────────────────────────────────────
   if (!subjectList.length) {
     return (
       <Shell role="student">
@@ -224,18 +263,72 @@ function Page() {
     );
   }
 
-  if (starting || !attempt) {
+  // ── Loading / starting ──────────────────────────────────────────
+  if (starting && !attempt) {
     return (
       <Shell role="student" subjectLabel={subjectLabel}>
         <div className="py-12 text-center">
-          <div className="text-muted-foreground">
-            {starting
-              ? "Starting your attempt…"
-              : openQuiz
-                ? "Starting your attempt…"
-                : "No quizzes are currently open."}
-          </div>
+          <div className="text-muted-foreground">Starting your attempt…</div>
         </div>
+      </Shell>
+    );
+  }
+
+  // ── Quiz list (no active attempt — explicit start required) ──────
+  if (!attempt) {
+    return (
+      <Shell role="student" subjectLabel={subjectLabel}>
+        <PageHead eyebrow="Quizzes" title="Available quizzes" />
+        <Card className="col-span-12">
+          {allQuizzes.length === 0 ? (
+            <div className="text-sm text-muted-foreground">
+              No quizzes are available for this subject.
+            </div>
+          ) : (
+            <div className="space-y-4">
+              {allQuizzes.map((q) => {
+                const isOpen =
+                  q.published &&
+                  q.opens_at &&
+                  new Date(q.opens_at) <= now &&
+                  q.closes_at &&
+                  new Date(q.closes_at) >= now;
+                const closed = q.published && q.closes_at && new Date(q.closes_at) < now;
+                const upcoming = q.published && q.opens_at && new Date(q.opens_at) > now;
+                let status = "Not published";
+                if (isOpen) {
+                  const al = q.attempts_left ?? 0;
+                  status = `${al} attempt${al === 1 ? "" : "s"} left`;
+                }
+                if (closed) status = "Closed";
+                if (upcoming) status = "Upcoming";
+                return (
+                  <div key={q.id} className="flex items-center justify-between rounded-xl border px-4 py-3">
+                    <div>
+                      <div className="font-semibold text-espresso">{q.title}</div>
+                      <div className="text-sm text-muted-foreground">{status}</div>
+                      {q.closes_at && isOpen && (
+                        <div className="text-xs text-wine">
+                          Closes <Clock className="inline size-3" />{" "}
+                          {formatDistanceToNow(new Date(q.closes_at), { addSuffix: true })}
+                        </div>
+                      )}
+                    </div>
+                    {isOpen && (q.attempts_left ?? 0) > 0 ? (
+                      <Btn size="sm" onClick={() => startAttempt(q.id)} disabled={starting}>
+                        Start attempt
+                      </Btn>
+                    ) : (
+                      <Btn size="sm" variant="secondary" disabled>
+                        {closed ? "Closed" : status}
+                      </Btn>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </Card>
       </Shell>
     );
   }
@@ -246,6 +339,7 @@ function Page() {
     .map((q, k) => (answers[q.id] === undefined ? k + 1 : null))
     .filter((x): x is number => x !== null);
 
+  // ── Results view ────────────────────────────────────────────────
   if (done && result && !reviewItems) {
     return (
       <Shell role="student" subjectLabel={subjectLabel}>
@@ -262,19 +356,14 @@ function Page() {
             </div>
             <div className="font-mono text-beige">
               {Math.round((result.total_score / result.max_score) * 100)}% ·{" "}
-              {attempt.attempts_left}{" "}
-              attempt{attempt.attempts_left === 1 ? "" : "s"} remaining
+              {attempt.attempts_left} attempt{attempt.attempts_left === 1 ? "" : "s"} remaining
             </div>
             <div className="mt-6 flex gap-3">
               <Btn variant="onWine" onClick={handleReview}>
                 Review answers
               </Btn>
-              {(openQuiz?.attempts_left ?? 0) > 0 && (
-                <Btn
-                  variant="ghost"
-                  className="text-ivory hover:bg-ivory/10"
-                  onClick={retry}
-                >
+              {attempt.attempts_left > 0 && (
+                <Btn variant="ghost" className="text-ivory hover:bg-ivory/10" onClick={retry}>
                   <RotateCcw className="size-4" /> Retry
                 </Btn>
               )}
@@ -293,7 +382,9 @@ function Page() {
                       tone={(c.percentage as number) < 60 ? "wine" : "blue"}
                     />
                   </div>
-                  <span className="font-mono text-sm">{Math.round(c.percentage as number)}%</span>
+                  <span className="font-mono text-sm">
+                    {Math.round(c.percentage as number)}%
+                  </span>
                 </div>
               ))}
           </Card>
@@ -302,7 +393,7 @@ function Page() {
     );
   }
 
-  // Review view
+  // ── Review view ─────────────────────────────────────────────────
   if (done && reviewItems) {
     return (
       <Shell role="student" subjectLabel={subjectLabel}>
@@ -315,15 +406,16 @@ function Page() {
             {reviewItems.map((item) => (
               <div key={item.question_id} className="border-b border-wine/10 py-4 last:border-0">
                 <div className="mb-2 flex items-center gap-2">
-                  <span className="font-mono text-xs text-wine">Q: CO{item.co_number}</span>
-                  <CO n={item.co_number} />
+                  <span className="font-mono text-xs text-wine">CO{item.co_number}</span>
                   {item.chosen === item.correct ? (
                     <span className="text-xs text-success">✓ Correct</span>
                   ) : (
                     <span className="text-xs text-wine">✗ Incorrect</span>
                   )}
                 </div>
-                <p className="font-serif text-lg font-semibold text-espresso">{item.question}</p>
+                <p className="font-serif text-lg font-semibold text-espresso">
+                  {item.question}
+                </p>
                 <div className="mt-2 grid grid-cols-2 gap-2">
                   {item.options.map((opt, i) => (
                     <div
@@ -337,7 +429,9 @@ function Page() {
                             : "border-wine/15",
                       )}
                     >
-                      <span className="font-mono text-xs text-muted-foreground">{"ABCD"[i]}</span>
+                      <span className="font-mono text-xs text-muted-foreground">
+                        {"ABCD"[i]}
+                      </span>
                       {opt}
                       {i === item.correct && (
                         <Check className="ml-auto size-4 text-success" />
@@ -364,6 +458,7 @@ function Page() {
     );
   }
 
+  // ── Active quiz UI ──────────────────────────────────────────────
   return (
     <Shell role="student" subjectLabel={subjectLabel}>
       <PageHead
@@ -378,6 +473,11 @@ function Page() {
           ) : undefined
         }
       />
+      {saveError && (
+        <div className="mb-2 rounded-full bg-oxblood/10 px-4 py-2 text-sm text-oxblood">
+          {saveError}
+        </div>
+      )}
       <div className="grid grid-cols-12 gap-5">
         <Card className="col-span-8">
           <div className="flex items-center justify-between text-sm">
@@ -385,7 +485,10 @@ function Page() {
               Question {currentQuestion + 1} of {questions.length}
             </span>
             <span
-              className={cn("text-xs text-success transition", saved ? "opacity-100" : "opacity-0")}
+              className={cn(
+                "text-xs text-success transition",
+                saved ? "opacity-100" : "opacity-0",
+              )}
             >
               ✓ Progress saved
             </span>

@@ -90,7 +90,6 @@ export function Shell({
     );
   }
 
-
   const displayName = user?.name ?? "";
   const idLabel =
     role === "faculty"

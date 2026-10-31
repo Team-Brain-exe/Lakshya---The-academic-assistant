@@ -32,8 +32,8 @@ function Login() {
     e.preventDefault();
     setServerError(null);
     const n: typeof err = {};
-    if (tab === "student" && !/^1[A-Z]{2}\d{2}[A-Z]{2}\d{3}$/i.test(id))
-      n.id = "Enter a valid USN, e.g. 1RV22CS018";
+    if (tab === "student" && !/^[A-Za-z0-9]{3,20}$/.test(id))
+      n.id = "Enter a valid USN";
     if (tab === "faculty" && id.length < 3) n.id = "Enter your email or username";
     if (tab === "student" && !/^\d{4,6}$/.test(pw)) n.pw = "PIN must be 4–6 digits";
     if (tab === "faculty" && pw.length < 6) n.pw = "Password must be at least 6 characters";

@@ -17,7 +17,7 @@ export const BASE_URL: string =
   import.meta.env.VITE_API_URL ?? "https://lakshya-the-academic-assistant.onrender.com";
 
 /** Where to send the user when their session is no longer valid. */
-export const LOGIN_PATH = "/login";
+export const LOGIN_PATH = "/";
 
 // ── Token management ────────────────────────────────────────────────────
 
@@ -180,8 +180,8 @@ export async function apiRequest<T>(path: string, options: RequestOptions = {}):
     throw new ApiError(0, "NETWORK_ERROR", "Network error — please check your connection.");
   }
 
-  // ── 401 → clear session & redirect ──
-  if (res.status === 401) {
+  // ── 401 → clear session & redirect (only for authenticated requests) ──
+  if (res.status === 401 && auth) {
     clearToken();
     if (typeof window !== "undefined" && typeof window.location !== "undefined") {
       window.location.href = LOGIN_PATH;

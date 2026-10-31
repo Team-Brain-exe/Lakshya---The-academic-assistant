@@ -13,7 +13,8 @@ import {
   useState,
   type ReactNode,
 } from "react";
-import { auth, setSession, usageApi, type LoginResponse, type User } from "@/lib/api";
+import { auth, clearToken, setToken, usageApi, type LoginResponse, type User, ApiError } from "@/lib/api";
+import { clearStoredSubjectId, clearSavedAttempt } from "@/lib/subject-context";
 
 interface AuthContextValue {
   user: User | null;
@@ -48,6 +49,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   const logout = () => {
     auth.logout();
+    clearStoredSubjectId();
+    clearSavedAttempt();
     setUser(null);
     setAuthenticated(false);
     setError(null);
@@ -73,16 +76,29 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   };
 
   const login = async (data: LoginResponse) => {
-    setSession(data);
+    // Persist the token from the login response immediately.
+    setToken(data.access_token);
     setAuthenticated(true);
+    // Use the server-provided user profile directly. /auth/me is called to
+    // refresh the profile, but if it fails we do NOT fall back to JWT data —
+    // we clear the session, surface the error, and re-throw so the caller
+    // (index.tsx) shows the message instead of silently navigating.
     try {
       const me = await auth.getMe();
       setUser(me);
-    } catch {
-      // Fall back to JWT-decoded identity if /me fails.
-      setUser(usageApi.currentUser());
+      setError(null);
+    } catch (e) {
+      // /auth/me failed after a successful login — invalid/expired token.
+      clearToken();
+      setUser(null);
+      setAuthenticated(false);
+      const msg =
+        e instanceof ApiError
+          ? e.message
+          : "Failed to load your profile. Please try again.";
+      setError(msg);
+      throw e;
     }
-    setError(null);
   };
 
   // On mount, confirm the session by calling /auth/me.
